@@ -1,0 +1,94 @@
+QMainWindow {
+    background: #f5f7fa;
+}
+
+QLabel {
+    color: #1f2937;
+    font-size: 14px;
+}
+
+#title {
+    font-size: 26px;
+    font-weight: 700;
+    color: #111827;
+}
+
+#subtitle {
+    font-size: 13px;
+    color: #6b7280;
+}
+
+#selectionFrame {
+    background: white;
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+}
+
+#fieldLabel {
+    min-width: 120px;
+    font-weight: 600;
+    color: #374151;
+}
+
+QComboBox {
+    min-height: 38px;
+    padding: 0 12px;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    background: white;
+    color: #111827;
+}
+
+QComboBox:hover {
+    border: 1px solid #9ca3af;
+}
+
+QComboBox:focus {
+    border: 1px solid #6b7280;
+}
+
+QPushButton#analyzeButton {
+    min-width: 140px;
+    min-height: 40px;
+    padding: 0 22px;
+    border: none;
+    border-radius: 6px;
+    background: #1f2937;
+    color: white;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+QPushButton#analyzeButton:hover {
+    background: #374151;
+}
+
+QPushButton#analyzeButton:pressed {
+    background: #111827;
+}
+
+#panel {
+    background: white;
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+}
+
+#panelTitle {
+    font-size: 16px;
+    font-weight: 700;
+    color: #111827;
+    padding-bottom: 6px;
+}
+
+#findingsOutput,
+#logOutput {
+    padding: 12px;
+    background: #f9fafb;
+    border: 1px solid #eef0f2;
+    border-radius: 6px;
+    color: #4b5563;
+}
+
+QStatusBar {
+    color: #6b7280;
+}
