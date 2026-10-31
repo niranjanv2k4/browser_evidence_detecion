@@ -39,6 +39,13 @@ QComboBox {
     color: #111827;
 }
 
+QComboBox QAbstractItemView {
+    background: white;
+    color: #111827;
+    selection-background-color: #e5e7eb;
+    selection-color: #111827;
+}
+
 QComboBox:hover {
     border: 1px solid #9ca3af;
 }
@@ -47,7 +54,8 @@ QComboBox:focus {
     border: 1px solid #6b7280;
 }
 
-QPushButton#analyzeButton {
+QPushButton#analyzeButton,
+QPushButton#fetchButton {
     min-width: 140px;
     min-height: 40px;
     padding: 0 22px;
@@ -59,11 +67,13 @@ QPushButton#analyzeButton {
     font-weight: 600;
 }
 
-QPushButton#analyzeButton:hover {
+QPushButton#analyzeButton:hover,
+QPushButton#fetchButton:hover {
     background: #374151;
 }
 
-QPushButton#analyzeButton:pressed {
+QPushButton#analyzeButton:pressed,
+QPushButton#fetchButton:pressed {
     background: #111827;
 }
 
