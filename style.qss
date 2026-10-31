@@ -55,7 +55,8 @@ QComboBox:focus {
 }
 
 QPushButton#analyzeButton,
-QPushButton#fetchButton {
+QPushButton#fetchButton,
+QPushButton#stopFetchButton {
     min-width: 140px;
     min-height: 40px;
     padding: 0 22px;
@@ -68,13 +69,21 @@ QPushButton#fetchButton {
 }
 
 QPushButton#analyzeButton:hover,
-QPushButton#fetchButton:hover {
+QPushButton#fetchButton:hover,
+QPushButton#stopFetchButton:hover {
     background: #374151;
 }
 
 QPushButton#analyzeButton:pressed,
-QPushButton#fetchButton:pressed {
+QPushButton#fetchButton:pressed,
+QPushButton#stopFetchButton:pressed {
     background: #111827;
+}
+
+/* Adds a greyed-out look when buttons are disabled */
+QPushButton:disabled {
+    background: #9ca3af;
+    color: #f3f4f6;
 }
 
 #panel {

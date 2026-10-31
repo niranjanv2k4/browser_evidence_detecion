@@ -24,12 +24,19 @@ class BrowserScannerWorker(QThread):
     def __init__(self, drive):
         super().__init__()
         self.drive = drive
+        self._is_running = True
 
     def run(self):
         browsers = get_installed_browsers(self.drive)
         for browser in browsers:
+            if not self._is_running:
+                break
             self.browser_found.emit(browser["name"], browser)
         self.finished.emit()
+
+    def stop(self):
+        self._is_running = False
+
 
 class AnalyzerWorker(QThread):
     log_emitted = Signal(str)
@@ -50,6 +57,7 @@ class AnalyzerWorker(QThread):
         )
         self.finished.emit(result)
 
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -59,19 +67,32 @@ class MainWindow(QMainWindow):
         self._build_ui()
 
     def _on_fetch_clicked(self):
+        # If already fetching, act as the Stop button
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            self.worker.stop()
+            self.fetch_button.setText("Stopping...")
+            self.fetch_button.setEnabled(False)
+            return
+
+        # Otherwise, start the fetching process
         drive = self.source_combo.currentText()
         if not drive or drive == "Select disk image...":
             return
 
         self.browser_combo.clear()
-        self.fetch_button.setText("Fetching...")
-        self.fetch_button.setEnabled(False)
+        self.fetch_button.setText("Stop Fetching")
         self.source_combo.setEnabled(False)
 
         self.worker = BrowserScannerWorker(drive)
         self.worker.browser_found.connect(self._on_browser_found)
         self.worker.finished.connect(self._on_fetch_finished)
         self.worker.start()
+
+    def _on_stop_fetch_clicked(self):
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            self.worker.stop()
+            self.stop_fetch_button.setEnabled(False)
+            self.fetch_button.setText("Stopping...")
 
     def _on_browser_found(self, name, data):
         display_text = f"{name} ({data['version']}) - {data['path']}"
@@ -97,7 +118,6 @@ class MainWindow(QMainWindow):
         self.analyze_button.setText("Analyzing...")
         self.analyze_button.setEnabled(False)
         
-        # FIXED: Use clear() and setPlainText() for QPlainTextEdit
         self.log_output.clear()
         self.findings_output.setPlainText("Analysis in progress...")
         
@@ -115,7 +135,6 @@ class MainWindow(QMainWindow):
         
         summary = result.summary
         
-        # FIXED: Formatted human-readable report instead of raw JSON
         report = (
             "=== BROWSER ANALYSIS REPORT ===\n\n"
             f"OVERVIEW\n"
@@ -226,7 +245,6 @@ class MainWindow(QMainWindow):
         findings_title = QLabel("Findings")
         findings_title.setObjectName("panelTitle")
 
-        # FIXED: Upgraded findings output to QPlainTextEdit for scrolling
         self.findings_output = QPlainTextEdit("Analysis results will appear here.")
         self.findings_output.setObjectName("findingsOutput")
         self.findings_output.setReadOnly(True)
