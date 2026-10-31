@@ -1,12 +1,14 @@
-from detection.browser_detection import BrowserDetector
+from detection.chrome_detection import find_chrome_registry_entries
 
 
-detector = BrowserDetector()
+entries = find_chrome_registry_entries()
 
-browsers = detector.detect()
-
-for name, information in browsers.items():
-    print(f"Browser: {name}")
-    print(f"Version: {information['version']}")
-    print(f"Location: {information['install_location']}")
-    print()
+if not entries:
+    print("Google Chrome was not found in the registry.")
+else:
+    for entry in entries:
+        print("Chrome found")
+        print("Name:", entry["display_name"])
+        print("Install location:", entry["install_location"])
+        print("Version:", entry["version"])
+        print()
