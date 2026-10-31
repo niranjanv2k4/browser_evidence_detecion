@@ -2,6 +2,7 @@ import json
 from detection.drive_detector import get_available_drives
 from detection.chrome_detection import get_installed_browsers
 from analysis.chrome_analyzer import analyze_chrome
+from analysis.firefox_analyzer import analyze_firefox
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
 
 class BrowserScannerWorker(QThread):
     browser_found = Signal(str, dict)
@@ -49,12 +51,23 @@ class AnalyzerWorker(QThread):
         self.exe_path = exe_path
 
     def run(self):
-        result = analyze_chrome(
-            selected_drive=self.drive,
-            selected_browser=self.browser_name,
-            target_exe_path=self.exe_path,
-            log_callback=lambda msg: self.log_emitted.emit(msg)
-        )
+        browser_lower = self.browser_name.lower()
+        
+        if "firefox" in browser_lower:
+            result = analyze_firefox(
+                selected_drive=self.drive,
+                selected_browser=self.browser_name,
+                target_exe_path=self.exe_path,
+                log_callback=lambda msg: self.log_emitted.emit(msg)
+            )
+        else:
+            result = analyze_chrome(
+                selected_drive=self.drive,
+                selected_browser=self.browser_name,
+                target_exe_path=self.exe_path,
+                log_callback=lambda msg: self.log_emitted.emit(msg)
+            )
+            
         self.finished.emit(result)
 
 
@@ -87,12 +100,6 @@ class MainWindow(QMainWindow):
         self.worker.browser_found.connect(self._on_browser_found)
         self.worker.finished.connect(self._on_fetch_finished)
         self.worker.start()
-
-    def _on_stop_fetch_clicked(self):
-        if hasattr(self, 'worker') and self.worker.isRunning():
-            self.worker.stop()
-            self.stop_fetch_button.setEnabled(False)
-            self.fetch_button.setText("Stopping...")
 
     def _on_browser_found(self, name, data):
         display_text = f"{name} ({data['version']}) - {data['path']}"
@@ -139,7 +146,18 @@ class MainWindow(QMainWindow):
             "=== BROWSER ANALYSIS REPORT ===\n\n"
             f"OVERVIEW\n"
             f"----------------------------------------\n"
-            f"Total Profiles Found    : {summary.get('profile_count', 0)}\n"
+        )
+        
+        if "confirmed_profile_count" in summary:
+            report += (
+                f"Confirmed Profiles      : {summary.get('confirmed_profile_count', 0)}\n"
+                f"Inferred Profiles       : {summary.get('inferred_profile_count', 0)}\n"
+                f"Unattributed Profiles   : {summary.get('unattributed_profile_count', 0)}\n"
+            )
+        else:
+            report += f"Total Profiles Found    : {summary.get('profile_count', 0)}\n"
+
+        report += (
             f"Profiles with History   : {summary.get('profiles_with_history', 0)}\n"
             f"Windows Users Detected  : {', '.join(summary.get('windows_users', []))}\n\n"
             f"BROWSING STATISTICS\n"
@@ -147,8 +165,20 @@ class MainWindow(QMainWindow):
             f"Total History Records   : {summary.get('history_record_count', 0):,}\n"
             f"Total Visits            : {summary.get('total_visits', 0):,}\n"
             f"Unique URLs Visited     : {summary.get('unique_url_count', 0):,}\n"
-            f"Unique Domains          : {summary.get('unique_domain_count', 0):,}\n\n"
-            f"TIMELINE\n"
+            f"Unique Domains          : {summary.get('unique_domain_count', 0):,}\n"
+        )
+
+        if "bookmark_count" in summary:
+            report += (
+                f"Bookmarks Found         : {summary.get('bookmark_count', 0):,}\n"
+                f"Downloads Logged        : {summary.get('download_count', 0):,}\n"
+                f"Form History Entries    : {summary.get('form_history_count', 0):,}\n"
+                f"Cookies (Metadata)      : {summary.get('cookie_count', 0):,}\n"
+                f"Extensions Installed    : {summary.get('extension_count', 0):,}\n"
+            )
+
+        report += (
+            f"\nTIMELINE\n"
             f"----------------------------------------\n"
             f"Earliest Record         : {summary.get('first_visit', 'N/A')}\n"
             f"Most Recent Record      : {summary.get('last_visit', 'N/A')}\n"
