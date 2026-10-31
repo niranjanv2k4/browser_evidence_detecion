@@ -1,5 +1,7 @@
+import json
 from detection.drive_detector import get_available_drives
 from detection.chrome_detection import get_installed_browsers
+from analysis.chrome_analyzer import analyze_chrome
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
@@ -28,6 +30,25 @@ class BrowserScannerWorker(QThread):
             self.browser_found.emit(browser["name"], browser)
         self.finished.emit()
 
+class AnalyzerWorker(QThread):
+    log_emitted = Signal(str)
+    finished = Signal(object)
+
+    def __init__(self, drive, browser_name, exe_path):
+        super().__init__()
+        self.drive = drive
+        self.browser_name = browser_name
+        self.exe_path = exe_path
+
+    def run(self):
+        result = analyze_chrome(
+            selected_drive=self.drive,
+            selected_browser=self.browser_name,
+            target_exe_path=self.exe_path,
+            log_callback=lambda msg: self.log_emitted.emit(msg)
+        )
+        self.finished.emit(result)
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -52,7 +73,7 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _on_browser_found(self, name, data):
-        display_text = f"{name} ({data['version']})"
+        display_text = f"{name} ({data['version']}) - {data['path']}"
         self.browser_combo.addItem(display_text, data)
 
     def _on_fetch_finished(self):
@@ -61,6 +82,37 @@ class MainWindow(QMainWindow):
         self.source_combo.setEnabled(True)
         if self.browser_combo.count() == 0:
             self.browser_combo.addItem("No browsers found")
+
+    def _on_analyze_clicked(self):
+        drive = self.source_combo.currentText()
+        browser_data = self.browser_combo.currentData()
+        
+        if not browser_data:
+            return
+            
+        browser_name = browser_data["name"]
+        exe_path = browser_data["path"]
+
+        self.analyze_button.setText("Analyzing...")
+        self.analyze_button.setEnabled(False)
+        self.log_output.setText("")
+        self.findings_output.setText("Analysis in progress...")
+        
+        self.analyzer_worker = AnalyzerWorker(drive, browser_name, exe_path)
+        self.analyzer_worker.log_emitted.connect(self._on_log_emitted)
+        self.analyzer_worker.finished.connect(self._on_analysis_finished)
+        self.analyzer_worker.start()
+
+    def _on_log_emitted(self, msg):
+        current_text = self.log_output.text()
+        self.log_output.setText(f"{current_text}\n{msg}".strip())
+
+    def _on_analysis_finished(self, result):
+        self.analyze_button.setText("Analyze")
+        self.analyze_button.setEnabled(True)
+        
+        summary_json = json.dumps(result.summary, indent=2)
+        self.findings_output.setText(f"Analysis Finished.\n\nSummary:\n{summary_json}")
 
     def _build_ui(self):
         central = QWidget()
@@ -128,6 +180,7 @@ class MainWindow(QMainWindow):
         self.analyze_button = QPushButton("Analyze")
         self.analyze_button.setObjectName("analyzeButton")
         self.analyze_button.setCursor(Qt.PointingHandCursor)
+        self.analyze_button.clicked.connect(self._on_analyze_clicked)
 
         button_row = QHBoxLayout()
         button_row.addStretch()
