@@ -3,7 +3,8 @@ from detection.drive_detector import get_available_drives
 from detection.chrome_detection import get_installed_browsers
 from analysis.chrome_analyzer import analyze_chrome
 from analysis.firefox_analyzer import analyze_firefox
-
+from analysis.brave_analyzer import analyze_brave
+from ui.websites_window import WebsitesWindow
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QComboBox,
@@ -60,6 +61,13 @@ class AnalyzerWorker(QThread):
                 target_exe_path=self.exe_path,
                 log_callback=lambda msg: self.log_emitted.emit(msg)
             )
+        elif "brave" in browser_lower:
+            result = analyze_brave(
+                selected_drive=self.drive,
+                selected_browser=self.browser_name,
+                target_exe_path=self.exe_path,
+                log_callback=lambda msg: self.log_emitted.emit(msg)
+            )
         else:
             result = analyze_chrome(
                 selected_drive=self.drive,
@@ -77,17 +85,16 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Browser Forensic Analyzer")
         self.resize(1200, 750)
         self.setMinimumSize(900, 600)
+        self.current_profiles_data = {}  # Store data for the popup
         self._build_ui()
 
     def _on_fetch_clicked(self):
-        # If already fetching, act as the Stop button
         if hasattr(self, 'worker') and self.worker.isRunning():
             self.worker.stop()
             self.fetch_button.setText("Stopping...")
             self.fetch_button.setEnabled(False)
             return
 
-        # Otherwise, start the fetching process
         drive = self.source_combo.currentText()
         if not drive or drive == "Select disk image...":
             return
@@ -124,6 +131,8 @@ class MainWindow(QMainWindow):
 
         self.analyze_button.setText("Analyzing...")
         self.analyze_button.setEnabled(False)
+        self.websites_button.setEnabled(False)
+        self.current_profiles_data = {}
         
         self.log_output.clear()
         self.findings_output.setPlainText("Analysis in progress...")
@@ -142,6 +151,7 @@ class MainWindow(QMainWindow):
         
         summary = result.summary
         
+        # 1. Build the report string
         report = (
             "=== BROWSER ANALYSIS REPORT ===\n\n"
             f"OVERVIEW\n"
@@ -157,34 +167,84 @@ class MainWindow(QMainWindow):
         else:
             report += f"Total Profiles Found    : {summary.get('profile_count', 0)}\n"
 
+        if "install_scope" in summary:
+            report += f"Install Scope           : {summary.get('install_scope', 'N/A')}\n"
+        if "channel" in summary:
+            report += f"Release Channel         : {summary.get('channel', 'N/A')}\n"
+
+        history_profiles = summary.get('profiles_with_history', 'N/A')
+        win_users = summary.get('windows_users', [])
+        users_str = ', '.join(win_users) if win_users else "N/A"
+        
+        if history_profiles != 'N/A':
+            report += f"Profiles with History   : {history_profiles}\n"
+        if win_users:
+            report += f"Windows Users Detected  : {users_str}\n"
+
+        hist_records = summary.get('history_record_count', summary.get('total_visits', 0))
+
         report += (
-            f"Profiles with History   : {summary.get('profiles_with_history', 0)}\n"
-            f"Windows Users Detected  : {', '.join(summary.get('windows_users', []))}\n\n"
-            f"BROWSING STATISTICS\n"
+            f"\nBROWSING STATISTICS\n"
             f"----------------------------------------\n"
-            f"Total History Records   : {summary.get('history_record_count', 0):,}\n"
+            f"Total History Records   : {hist_records:,}\n"
             f"Total Visits            : {summary.get('total_visits', 0):,}\n"
             f"Unique URLs Visited     : {summary.get('unique_url_count', 0):,}\n"
             f"Unique Domains          : {summary.get('unique_domain_count', 0):,}\n"
         )
 
-        if "bookmark_count" in summary:
+        if any(k in summary for k in ("bookmark_count", "download_count", "form_history_count", "cookie_count", "extension_count")):
             report += (
                 f"Bookmarks Found         : {summary.get('bookmark_count', 0):,}\n"
                 f"Downloads Logged        : {summary.get('download_count', 0):,}\n"
-                f"Form History Entries    : {summary.get('form_history_count', 0):,}\n"
-                f"Cookies (Metadata)      : {summary.get('cookie_count', 0):,}\n"
-                f"Extensions Installed    : {summary.get('extension_count', 0):,}\n"
             )
+            if "form_history_count" in summary:
+                report += f"Form History Entries    : {summary.get('form_history_count', 0):,}\n"
+            if "cookie_count" in summary:
+                report += f"Cookies (Metadata)      : {summary.get('cookie_count', 0):,}\n"
+            if "extension_count" in summary:
+                report += f"Extensions Installed    : {summary.get('extension_count', 0):,}\n"
 
-        report += (
-            f"\nTIMELINE\n"
-            f"----------------------------------------\n"
-            f"Earliest Record         : {summary.get('first_visit', 'N/A')}\n"
-            f"Most Recent Record      : {summary.get('last_visit', 'N/A')}\n"
-        )
+        if "first_visit" in summary or "last_visit" in summary:
+            report += (
+                f"\nTIMELINE\n"
+                f"----------------------------------------\n"
+                f"Earliest Record         : {summary.get('first_visit', 'N/A')}\n"
+                f"Most Recent Record      : {summary.get('last_visit', 'N/A')}\n"
+            )
         
         self.findings_output.setPlainText(report)
+        
+        # 2. Extract detailed history for the popup window
+        for p in result.profiles:
+            # Handle standard browsers vs Brave
+            records = getattr(p, 'history', getattr(p, 'visits', []))
+            
+            history_list = []
+            for r in records:
+                history_list.append({
+                    'visit_time': getattr(r, 'visit_time', 'N/A'),
+                    'url': getattr(r, 'url', ''),
+                    'title': getattr(r, 'title', '')
+                })
+                
+            # Sort newest first
+            history_list.sort(key=lambda x: x['visit_time'] or '', reverse=True)
+            
+            # Determine best name to show in the dropdown
+            name = getattr(p, 'profile_name', getattr(p, 'display_name', None))
+            if not name:
+                name = getattr(p, 'directory_name', f"Profile {len(self.current_profiles_data)}")
+            
+            self.current_profiles_data[f"{name} ({getattr(p, 'windows_user', 'User')})"] = history_list
+
+        # Enable the Websites button if there is data
+        if self.current_profiles_data:
+            self.websites_button.setEnabled(True)
+
+    def _show_websites_window(self):
+        # Open the popup dialog
+        self.websites_dialog = WebsitesWindow(self.current_profiles_data, self)
+        self.websites_dialog.exec()
 
     def _build_ui(self):
         central = QWidget()
@@ -265,6 +325,7 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
 
+        # --- Findings Frame ---
         findings_frame = QFrame()
         findings_frame.setObjectName("panel")
 
@@ -279,9 +340,17 @@ class MainWindow(QMainWindow):
         self.findings_output.setObjectName("findingsOutput")
         self.findings_output.setReadOnly(True)
 
-        findings_layout.addWidget(findings_title)
-        findings_layout.addWidget(self.findings_output, 1)
+        self.websites_button = QPushButton("Websites")
+        self.websites_button.setObjectName("websitesButton")
+        self.websites_button.setCursor(Qt.PointingHandCursor)
+        self.websites_button.setEnabled(False)
+        self.websites_button.clicked.connect(self._show_websites_window)
 
+        findings_layout.addWidget(findings_title)
+        findings_layout.addWidget(self.findings_output, 1)  # Stretch applied here
+        findings_layout.addWidget(self.websites_button)     # Button at the bottom
+
+        # --- Log Frame ---
         log_frame = QFrame()
         log_frame.setObjectName("panel")
 

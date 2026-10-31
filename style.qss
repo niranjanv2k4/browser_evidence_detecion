@@ -1,4 +1,4 @@
-QMainWindow {
+QMainWindow, QDialog {
     background: #f5f7fa;
 }
 
@@ -54,9 +54,11 @@ QComboBox:focus {
     border: 1px solid #6b7280;
 }
 
+QPushButton#websitesButton,
 QPushButton#analyzeButton,
 QPushButton#fetchButton,
-QPushButton#stopFetchButton {
+QPushButton#stopFetchButton,
+QDialog QPushButton {
     min-width: 140px;
     min-height: 40px;
     padding: 0 22px;
@@ -68,15 +70,19 @@ QPushButton#stopFetchButton {
     font-weight: 600;
 }
 
+QPushButton#websitesButton:hover,
 QPushButton#analyzeButton:hover,
 QPushButton#fetchButton:hover,
-QPushButton#stopFetchButton:hover {
+QPushButton#stopFetchButton:hover,
+QDialog QPushButton:hover {
     background: #374151;
 }
 
+QPushButton#websitesButton:pressed,
 QPushButton#analyzeButton:pressed,
 QPushButton#fetchButton:pressed,
-QPushButton#stopFetchButton:pressed {
+QPushButton#stopFetchButton:pressed,
+QDialog QPushButton:pressed {
     background: #111827;
 }
 
@@ -110,4 +116,34 @@ QPushButton:disabled {
 
 QStatusBar {
     color: #6b7280;
+}
+
+/* --- New Styles for the Websites History Popup --- */
+QTableWidget {
+    background: white;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    gridline-color: #eef0f2;
+    color: #4b5563;
+    font-size: 13px;
+}
+
+QHeaderView::section {
+    background-color: #f9fafb;
+    color: #374151;
+    font-weight: 600;
+    padding: 8px;
+    border: none;
+    border-right: 1px solid #e5e7eb;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+QTableWidget::item {
+    padding: 4px;
+    border-bottom: 1px solid #eef0f2;
+}
+
+QTableWidget::item:selected {
+    background-color: #e5e7eb;
+    color: #111827;
 }
