@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QPlainTextEdit,
     QPushButton,
     QSplitter,
     QVBoxLayout,
@@ -95,8 +96,10 @@ class MainWindow(QMainWindow):
 
         self.analyze_button.setText("Analyzing...")
         self.analyze_button.setEnabled(False)
-        self.log_output.setText("")
-        self.findings_output.setText("Analysis in progress...")
+        
+        # FIXED: Use clear() and setPlainText() for QPlainTextEdit
+        self.log_output.clear()
+        self.findings_output.setPlainText("Analysis in progress...")
         
         self.analyzer_worker = AnalyzerWorker(drive, browser_name, exe_path)
         self.analyzer_worker.log_emitted.connect(self._on_log_emitted)
@@ -104,15 +107,35 @@ class MainWindow(QMainWindow):
         self.analyzer_worker.start()
 
     def _on_log_emitted(self, msg):
-        current_text = self.log_output.text()
-        self.log_output.setText(f"{current_text}\n{msg}".strip())
+        self.log_output.appendPlainText(msg)
 
     def _on_analysis_finished(self, result):
         self.analyze_button.setText("Analyze")
         self.analyze_button.setEnabled(True)
         
-        summary_json = json.dumps(result.summary, indent=2)
-        self.findings_output.setText(f"Analysis Finished.\n\nSummary:\n{summary_json}")
+        summary = result.summary
+        
+        # FIXED: Formatted human-readable report instead of raw JSON
+        report = (
+            "=== BROWSER ANALYSIS REPORT ===\n\n"
+            f"OVERVIEW\n"
+            f"----------------------------------------\n"
+            f"Total Profiles Found    : {summary.get('profile_count', 0)}\n"
+            f"Profiles with History   : {summary.get('profiles_with_history', 0)}\n"
+            f"Windows Users Detected  : {', '.join(summary.get('windows_users', []))}\n\n"
+            f"BROWSING STATISTICS\n"
+            f"----------------------------------------\n"
+            f"Total History Records   : {summary.get('history_record_count', 0):,}\n"
+            f"Total Visits            : {summary.get('total_visits', 0):,}\n"
+            f"Unique URLs Visited     : {summary.get('unique_url_count', 0):,}\n"
+            f"Unique Domains          : {summary.get('unique_domain_count', 0):,}\n\n"
+            f"TIMELINE\n"
+            f"----------------------------------------\n"
+            f"Earliest Record         : {summary.get('first_visit', 'N/A')}\n"
+            f"Most Recent Record      : {summary.get('last_visit', 'N/A')}\n"
+        )
+        
+        self.findings_output.setPlainText(report)
 
     def _build_ui(self):
         central = QWidget()
@@ -203,10 +226,10 @@ class MainWindow(QMainWindow):
         findings_title = QLabel("Findings")
         findings_title.setObjectName("panelTitle")
 
-        self.findings_output = QLabel("Analysis results will appear here.")
+        # FIXED: Upgraded findings output to QPlainTextEdit for scrolling
+        self.findings_output = QPlainTextEdit("Analysis results will appear here.")
         self.findings_output.setObjectName("findingsOutput")
-        self.findings_output.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.findings_output.setWordWrap(True)
+        self.findings_output.setReadOnly(True)
 
         findings_layout.addWidget(findings_title)
         findings_layout.addWidget(self.findings_output, 1)
@@ -221,10 +244,9 @@ class MainWindow(QMainWindow):
         log_title = QLabel("Analysis Log")
         log_title.setObjectName("panelTitle")
 
-        self.log_output = QLabel("Analysis activity will appear here.")
+        self.log_output = QPlainTextEdit("Analysis activity will appear here.")
         self.log_output.setObjectName("logOutput")
-        self.log_output.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.log_output.setWordWrap(True)
+        self.log_output.setReadOnly(True)
 
         log_layout.addWidget(log_title)
         log_layout.addWidget(self.log_output, 1)
