@@ -39,6 +39,8 @@ copy is queried; nothing is written to the source drive; Firefox is never launch
 
 import configparser
 import hashlib
+import json
+import ntpath
 import os
 import re
 import shutil
@@ -50,7 +52,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 
 # ================================================================== models
@@ -86,6 +88,23 @@ class VisitRecord:
 
 
 @dataclass
+class DownloadRecord:
+    """One download recorded in places.sqlite (moz_annos 'downloads/*' annotations).
+    Firefox stores far less than Chromium, so only these fields exist."""
+    download_id: Optional[int] = None       # moz_places.id of the downloaded URL
+    file_name: str = ""
+    target_path: str = ""                   # where the file was saved
+    url: str = ""                           # URL the file came from
+    referrer: str = ""                      # page the download was started from (if known)
+    start_time: Optional[str] = None        # UTC
+    end_time: Optional[str] = None          # UTC
+    total_bytes: int = 0
+    state: str = "Unknown"
+    profile: str = ""
+    extra: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class ProfileResult:
     directory_name: str
     path: str
@@ -102,6 +121,7 @@ class ProfileResult:
     bookmark_count: int = 0
     download_count: int = 0
     extension_count: int = 0
+    downloads: List[DownloadRecord] = field(default_factory=list)
 
 
 @dataclass
@@ -749,7 +769,117 @@ def _read_places(connection: sqlite3.Connection, profile: str, logger: AnalysisL
             "WHERE n.name = 'downloads/destinationFileURI'").fetchone()[0]
     except sqlite3.Error as exc:
         logger.warning(f"Download records unavailable for {profile}: {exc}")
-    return {"visits": visits, "bookmarks": int(bookmarks or 0), "downloads": int(downloads or 0)}
+    return {"visits": visits, "bookmarks": int(bookmarks or 0), "downloads": int(downloads or 0),
+            "download_records": _read_firefox_downloads(connection, profile, logger)}
+
+
+# ============================================================ downloads
+# State values stored in the 'downloads/metaData' annotation (Firefox DownloadHistory).
+FIREFOX_DOWNLOAD_STATES = {
+    1: "Complete", 2: "Failed", 3: "Cancelled", 4: "Paused", 5: "Queued",
+    6: "Blocked (parental controls)", 7: "Scanning",
+    8: "Blocked (malware / reputation)", 9: "Blocked (policy)",
+}
+
+
+def _file_uri_to_path(uri: str) -> str:
+    """'file:///C:/Users/a/Downloads/x%20y.zip' -> 'C:\\Users\\a\\Downloads\\x y.zip'."""
+    if not uri:
+        return ""
+    lowered = uri.lower()
+    if lowered.startswith("file:///"):
+        rest = unquote(uri[8:])
+        return rest.replace("/", "\\") if re.match(r"^[A-Za-z]:", rest) else "/" + rest
+    if lowered.startswith("file://"):
+        return "\\\\" + unquote(uri[7:]).replace("/", "\\")     # UNC path
+    return unquote(uri)
+
+
+def _ms_epoch_to_string(value: Any) -> Optional[str]:
+    try:
+        number = int(value)
+        if number <= 0:
+            return None
+        return format_utc(UNIX_EPOCH + timedelta(milliseconds=number))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _read_firefox_downloads(connection: sqlite3.Connection, profile: str,
+                            logger: AnalysisLogger) -> List[DownloadRecord]:
+    """Downloads from an open places.sqlite connection. Never raises.
+
+    destination  : moz_annos 'downloads/destinationFileURI' (saved file)
+    metadata     : moz_annos 'downloads/metaData' JSON (state, endTime, fileSize, ...)
+    source URL   : moz_places.url of the annotated place
+    start time   : latest download-type visit (visit_type 7), else when the annotation was added
+    referrer     : the page visit that led to that download visit (from_visit)
+    """
+    try:
+        rows = connection.execute(
+            "SELECT p.id, p.url, p.title, d.content, d.dateAdded, m.content "
+            "FROM moz_places p "
+            "JOIN moz_annos d ON d.place_id = p.id AND d.anno_attribute_id = "
+            "(SELECT id FROM moz_anno_attributes WHERE name = 'downloads/destinationFileURI') "
+            "LEFT JOIN moz_annos m ON m.place_id = p.id AND m.anno_attribute_id = "
+            "(SELECT id FROM moz_anno_attributes WHERE name = 'downloads/metaData') "
+            "ORDER BY d.dateAdded DESC").fetchall()
+    except sqlite3.Error as exc:
+        logger.warning(f"Download details unavailable for {profile}: {exc}")
+        return []
+
+    starts: Dict[int, Any] = {}
+    referrers: Dict[int, str] = {}
+    try:
+        for place_id, when in connection.execute(
+                "SELECT place_id, MAX(visit_date) FROM moz_historyvisits "
+                "WHERE visit_type = 7 GROUP BY place_id"):
+            starts[place_id] = when
+        for place_id, ref_url in connection.execute(
+                "SELECT v.place_id, p2.url FROM moz_historyvisits v "
+                "JOIN moz_historyvisits fv ON fv.id = v.from_visit "
+                "JOIN moz_places p2 ON p2.id = fv.place_id "
+                "WHERE v.visit_type = 7 ORDER BY v.visit_date"):
+            referrers[place_id] = ref_url or ""
+    except sqlite3.Error:
+        logger.warning(f"Download visit/referrer data unavailable for {profile}.")
+
+    records: List[DownloadRecord] = []
+    for place_id, url, title, destination, added, meta_text in rows:
+        meta: Dict[str, Any] = {}
+        if meta_text:
+            try:
+                parsed = json.loads(meta_text)
+                meta = parsed if isinstance(parsed, dict) else {}
+            except ValueError:
+                logger.warning(f"Unreadable download metadata for {profile} (place {place_id}).")
+        target = _file_uri_to_path(destination or "")
+        name = ntpath.basename(target) or os.path.basename(urlparse(url or "").path) or "(unknown)"
+        state = meta.get("state")
+        try:
+            size = int(meta.get("fileSize") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        extra: Dict[str, str] = {}
+        if title:
+            extra["Page Title"] = title
+        added_text = firefox_time_to_string(added)
+        if added_text:
+            extra["Annotation Added"] = added_text
+        if "deleted" in meta:
+            extra["File Deleted"] = "Yes" if meta.get("deleted") else "No"
+        if meta.get("reputationCheckVerdict"):
+            extra["Reputation Verdict"] = str(meta["reputationCheckVerdict"])
+        records.append(DownloadRecord(
+            download_id=place_id, file_name=name, target_path=target, url=url or "",
+            referrer=referrers.get(place_id, ""),
+            start_time=firefox_time_to_string(starts.get(place_id)) or added_text,
+            end_time=_ms_epoch_to_string(meta.get("endTime")),
+            total_bytes=max(size, 0),
+            state=(FIREFOX_DOWNLOAD_STATES.get(state, f"Unknown ({state})")
+                   if state is not None else "Unknown (no metadata)"),
+            profile=profile, extra=extra))
+    return records
 
 
 def _count_extensions(profile_path: str, profile: str, logger: AnalysisLogger) -> int:
@@ -797,6 +927,7 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
     profile.unique_domain_count = len({get_domain(v.url) for v in profile.visits} - {None})
     profile.bookmark_count = data["bookmarks"]
     profile.download_count = data["downloads"]
+    profile.downloads = data["download_records"]
     profile.history_status = (f"Read OK ({method})" if profile.visits
                               else f"Read OK, no records ({method})")
     logger.info(f"{name}: {profile.visit_count:,} visits, {profile.unique_url_count:,} unique URLs, "
