@@ -45,6 +45,7 @@ as unavailable, never as proof of non-use.
 
 import hashlib
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -80,6 +81,38 @@ class VisitRecord:
 
 
 @dataclass
+class DownloadRecord:
+    """One row of Chrome's 'downloads' table (plus its redirect chain)."""
+    download_id: Optional[int] = None
+    guid: str = ""
+    file_name: str = ""
+    target_path: str = ""          # where the file was saved
+    current_path: str = ""         # in-progress / temp path (may equal target_path)
+    url: str = ""                  # final URL the file came from
+    url_chain: List[str] = field(default_factory=list)  # every URL incl. redirects
+    referrer: str = ""
+    site_url: str = ""
+    tab_url: str = ""
+    tab_referrer_url: str = ""
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    last_access_time: Optional[str] = None
+    received_bytes: int = 0
+    total_bytes: int = 0
+    state: str = "Unknown"
+    danger_type: str = "Unknown"
+    interrupt_reason: str = "None"
+    opened: bool = False
+    mime_type: str = ""
+    original_mime_type: str = ""
+    etag: str = ""
+    last_modified: str = ""
+    http_method: str = ""
+    by_extension: str = ""         # extension that triggered the download, if any
+    profile: str = ""
+
+
+@dataclass
 class ProfileResult:
     directory_name: str                         # "Default", "Profile 1", ...
     path: str
@@ -95,6 +128,7 @@ class ProfileResult:
     bookmark_count: int = 0
     download_count: int = 0
     extension_count: int = 0
+    downloads: List[DownloadRecord] = field(default_factory=list)
 
 
 @dataclass
@@ -485,7 +519,137 @@ def _read_history(connection: sqlite3.Connection, profile: str, logger: Analysis
         downloads = int(connection.execute("SELECT COUNT(*) FROM downloads").fetchone()[0] or 0)
     except sqlite3.Error as exc:
         logger.warning(f"Download records unavailable for {profile}: {exc}")
-    return {"visits": visits, "downloads": downloads}
+    return {"visits": visits, "downloads": downloads,
+            "download_records": read_downloads(connection, profile, logger)}
+
+
+# ============================================================ downloads reading
+# Values from Chromium's download_item / download_danger_type / download_interrupt_reason enums.
+DOWNLOAD_STATES = {0: "In progress", 1: "Complete", 2: "Cancelled",
+                   3: "Interrupted", 4: "Dangerous"}
+
+DANGER_TYPES = {
+    0: "Not dangerous", 1: "Dangerous file", 2: "Dangerous URL",
+    3: "Dangerous content", 4: "Maybe dangerous content", 5: "Uncommon content",
+    6: "Dangerous host", 7: "Potentially unwanted", 8: "Allowlisted by policy",
+    9: "Pending scan", 10: "Blocked (password protected)", 11: "Blocked (too large)",
+    12: "Sensitive content warning", 13: "Sensitive content blocked",
+    14: "Deep scanned (safe)", 15: "Deep scanned (opened dangerous)",
+    16: "Prompt for scanning", 17: "Blocked (unsupported file type)",
+    18: "Account compromise",
+}
+
+INTERRUPT_REASONS = {
+    0: "None", 1: "File error", 2: "Access denied", 3: "Disk full",
+    5: "File too large", 6: "Virus detected", 7: "Transient error", 10: "Blocked",
+    11: "Security check failed", 12: "File too short", 13: "Hash mismatch",
+    14: "Same as source", 20: "Network failed", 21: "Network timeout",
+    22: "Network disconnected", 23: "Server down", 24: "Invalid network request",
+    30: "Server failed", 31: "Server does not support range", 32: "Bad server content",
+    33: "Server unauthorized", 34: "Server certificate problem", 35: "Server forbidden",
+    36: "Server unreachable", 37: "Content length mismatch",
+    38: "Cross-origin redirect", 40: "Canceled by user", 41: "Browser shutdown",
+    50: "Browser crash",
+}
+
+_DOWNLOAD_COLUMNS = (
+    "id", "guid", "current_path", "target_path", "start_time", "end_time",
+    "received_bytes", "total_bytes", "state", "danger_type", "interrupt_reason",
+    "opened", "last_access_time", "referrer", "site_url", "tab_url",
+    "tab_referrer_url", "mime_type", "original_mime_type", "etag",
+    "last_modified", "http_method", "by_ext_name",
+)
+
+
+def _enum_label(mapping: Dict[int, str], value: Any) -> str:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return "Unknown"
+    return mapping.get(number, f"Unknown ({number})")
+
+
+def _download_file_name(target: str, current: str, url: str) -> str:
+    for path in (target, current):
+        if path:
+            name = ntpath.basename(path)   # handles both \\ and / separators
+            if name:
+                return name
+    try:
+        name = os.path.basename(urlparse(url).path)
+    except ValueError:
+        name = ""
+    return name or "(unknown)"
+
+
+def read_downloads(connection: sqlite3.Connection, profile_name: str,
+                   logger: AnalysisLogger) -> List[DownloadRecord]:
+    """Read Chrome's 'downloads' + 'downloads_url_chains' tables from an open
+    History connection. Column names differ between Chrome versions, so only
+    columns that actually exist are selected. Never raises."""
+    try:
+        available = {row[1] for row in connection.execute("PRAGMA table_info(downloads)")}
+    except sqlite3.Error as exc:
+        logger.warning(f"Could not inspect downloads table for {profile_name}: {exc}")
+        return []
+    if not available:
+        logger.info(f"{profile_name}: no 'downloads' table in History database.")
+        return []
+
+    columns = [c for c in _DOWNLOAD_COLUMNS if c in available]
+    query = f"SELECT {', '.join(columns)} FROM downloads"
+    if "start_time" in available:
+        query += " ORDER BY start_time DESC"
+
+    chains: Dict[int, List[str]] = {}
+    try:
+        for dl_id, url in connection.execute(
+                "SELECT id, url FROM downloads_url_chains ORDER BY id, chain_index"):
+            chains.setdefault(dl_id, []).append(url or "")
+    except sqlite3.Error:
+        logger.warning(f"'downloads_url_chains' unavailable for {profile_name}; "
+                       "download source URLs may be missing.")
+
+    records: List[DownloadRecord] = []
+    try:
+        for values in connection.execute(query):
+            row = dict(zip(columns, values))
+            chain = chains.get(row.get("id"), [])
+            target = row.get("target_path") or ""
+            current = row.get("current_path") or ""
+            url = chain[-1] if chain else ""
+            records.append(DownloadRecord(
+                download_id=row.get("id"),
+                guid=row.get("guid") or "",
+                file_name=_download_file_name(target, current, url),
+                target_path=target,
+                current_path=current,
+                url=url,
+                url_chain=chain,
+                referrer=row.get("referrer") or "",
+                site_url=row.get("site_url") or "",
+                tab_url=row.get("tab_url") or "",
+                tab_referrer_url=row.get("tab_referrer_url") or "",
+                start_time=chrome_time_to_string(row.get("start_time")),
+                end_time=chrome_time_to_string(row.get("end_time")),
+                last_access_time=chrome_time_to_string(row.get("last_access_time")),
+                received_bytes=int(row.get("received_bytes") or 0),
+                total_bytes=int(row.get("total_bytes") or 0),
+                state=_enum_label(DOWNLOAD_STATES, row.get("state")),
+                danger_type=_enum_label(DANGER_TYPES, row.get("danger_type")),
+                interrupt_reason=_enum_label(INTERRUPT_REASONS, row.get("interrupt_reason")),
+                opened=bool(row.get("opened")),
+                mime_type=row.get("mime_type") or "",
+                original_mime_type=row.get("original_mime_type") or "",
+                etag=row.get("etag") or "",
+                last_modified=row.get("last_modified") or "",
+                http_method=row.get("http_method") or "",
+                by_extension=row.get("by_ext_name") or "",
+                profile=profile_name,
+            ))
+    except sqlite3.Error as exc:
+        logger.warning(f"Downloads could not be fully read for {profile_name}: {exc}")
+    return records
 
 
 def _count_bookmarks(profile_path: str, profile: str, logger: AnalysisLogger) -> int:
@@ -545,6 +709,7 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
     profile.visits = data["visits"]
     profile.history_db_sha256 = digest
     profile.download_count = data["downloads"]
+    profile.downloads = data["download_records"]
     profile.visit_count = len(profile.visits)
     profile.unique_url_count = len({v.url for v in profile.visits})
     profile.unique_domain_count = len({get_domain(v.url) for v in profile.visits} - {None})
