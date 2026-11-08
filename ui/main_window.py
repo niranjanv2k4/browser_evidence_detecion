@@ -1,3 +1,4 @@
+# ui/main_window.py
 import json
 from detection.drive_detector import get_available_drives
 from detection.chrome_detection import get_installed_browsers
@@ -5,6 +6,11 @@ from analysis.chrome_analyzer import analyze_chrome
 from analysis.firefox_analyzer import analyze_firefox
 from analysis.brave_analyzer import analyze_brave
 from ui.websites_window import WebsitesWindow
+<<<<<<< Updated upstream
+=======
+from ui.downloads_window import DownloadsWindow
+from ui.cookies_window import CookiesWindow
+>>>>>>> Stashed changes
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QComboBox,
@@ -85,7 +91,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Browser Forensic Analyzer")
         self.resize(1200, 750)
         self.setMinimumSize(900, 600)
+<<<<<<< Updated upstream
         self.current_profiles_data = {}  # Store data for the popup
+=======
+        self.current_profiles_data = {}
+        self.current_downloads_data = {}
+        self.current_cookies_data = {}
+>>>>>>> Stashed changes
         self._build_ui()
 
     def _on_fetch_clicked(self):
@@ -132,7 +144,15 @@ class MainWindow(QMainWindow):
         self.analyze_button.setText("Analyzing...")
         self.analyze_button.setEnabled(False)
         self.websites_button.setEnabled(False)
+<<<<<<< Updated upstream
         self.current_profiles_data = {}
+=======
+        self.downloads_button.setEnabled(False)
+        self.cookies_button.setEnabled(False)
+        self.current_profiles_data = {}
+        self.current_downloads_data = {}
+        self.current_cookies_data = {}
+>>>>>>> Stashed changes
         
         self.log_output.clear()
         self.findings_output.setPlainText("Analysis in progress...")
@@ -151,7 +171,6 @@ class MainWindow(QMainWindow):
         
         summary = result.summary
         
-        # 1. Build the report string
         report = (
             "=== BROWSER ANALYSIS REPORT ===\n\n"
             f"OVERVIEW\n"
@@ -200,7 +219,7 @@ class MainWindow(QMainWindow):
             if "form_history_count" in summary:
                 report += f"Form History Entries    : {summary.get('form_history_count', 0):,}\n"
             if "cookie_count" in summary:
-                report += f"Cookies (Metadata)      : {summary.get('cookie_count', 0):,}\n"
+                report += f"Cookies Found           : {summary.get('cookie_count', 0):,}\n"
             if "extension_count" in summary:
                 report += f"Extensions Installed    : {summary.get('extension_count', 0):,}\n"
 
@@ -214,9 +233,7 @@ class MainWindow(QMainWindow):
         
         self.findings_output.setPlainText(report)
         
-        # 2. Extract detailed history for the popup window
         for p in result.profiles:
-            # Handle standard browsers vs Brave
             records = getattr(p, 'history', getattr(p, 'visits', []))
             
             history_list = []
@@ -227,25 +244,54 @@ class MainWindow(QMainWindow):
                     'title': getattr(r, 'title', '')
                 })
                 
-            # Sort newest first
             history_list.sort(key=lambda x: x['visit_time'] or '', reverse=True)
             
-            # Determine best name to show in the dropdown
             name = getattr(p, 'profile_name', getattr(p, 'display_name', None))
             if not name:
                 name = getattr(p, 'directory_name', f"Profile {len(self.current_profiles_data)}")
             
+<<<<<<< Updated upstream
             self.current_profiles_data[f"{name} ({getattr(p, 'windows_user', 'User')})"] = history_list
+=======
+            label = f"{name} ({getattr(p, 'windows_user', 'User')})"
+            self.current_profiles_data[label] = history_list
 
-        # Enable the Websites button if there is data
+            self.current_downloads_data[label] = [
+                asdict(d) for d in getattr(p, 'downloads', [])
+            ]
+            
+            self.current_cookies_data[label] = [
+                asdict(c) for c in getattr(p, 'cookies', [])
+            ]
+>>>>>>> Stashed changes
+
         if self.current_profiles_data:
             self.websites_button.setEnabled(True)
 
+<<<<<<< Updated upstream
+=======
+        if any(self.current_downloads_data.values()):
+            self.downloads_button.setEnabled(True)
+            
+        if any(self.current_cookies_data.values()):
+            self.cookies_button.setEnabled(True)
+
+>>>>>>> Stashed changes
     def _show_websites_window(self):
-        # Open the popup dialog
         self.websites_dialog = WebsitesWindow(self.current_profiles_data, self)
         self.websites_dialog.exec()
 
+<<<<<<< Updated upstream
+=======
+    def _show_downloads_window(self):
+        self.downloads_dialog = DownloadsWindow(self.current_downloads_data, self)
+        self.downloads_dialog.exec()
+
+    def _show_cookies_window(self):
+        self.cookies_dialog = CookiesWindow(self.current_cookies_data, self)
+        self.cookies_dialog.exec()
+
+>>>>>>> Stashed changes
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -325,7 +371,6 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
 
-        # --- Findings Frame ---
         findings_frame = QFrame()
         findings_frame.setObjectName("panel")
 
@@ -346,11 +391,34 @@ class MainWindow(QMainWindow):
         self.websites_button.setEnabled(False)
         self.websites_button.clicked.connect(self._show_websites_window)
 
+<<<<<<< Updated upstream
         findings_layout.addWidget(findings_title)
         findings_layout.addWidget(self.findings_output, 1)  # Stretch applied here
         findings_layout.addWidget(self.websites_button)     # Button at the bottom
+=======
+        self.downloads_button = QPushButton("Downloads")
+        self.downloads_button.setObjectName("websitesButton")
+        self.downloads_button.setCursor(Qt.PointingHandCursor)
+        self.downloads_button.setEnabled(False)
+        self.downloads_button.clicked.connect(self._show_downloads_window)
+        
+        self.cookies_button = QPushButton("Cookies")
+        self.cookies_button.setObjectName("websitesButton")
+        self.cookies_button.setCursor(Qt.PointingHandCursor)
+        self.cookies_button.setEnabled(False)
+        self.cookies_button.clicked.connect(self._show_cookies_window)
 
-        # --- Log Frame ---
+        buttons_row = QHBoxLayout()
+        buttons_row.setSpacing(10)
+        buttons_row.addWidget(self.websites_button, 1)
+        buttons_row.addWidget(self.downloads_button, 1)
+        buttons_row.addWidget(self.cookies_button, 1)
+
+        findings_layout.addWidget(findings_title)
+        findings_layout.addWidget(self.findings_output, 1)
+        findings_layout.addLayout(buttons_row)
+>>>>>>> Stashed changes
+
         log_frame = QFrame()
         log_frame.setObjectName("panel")
 
