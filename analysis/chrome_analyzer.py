@@ -1,32 +1,4 @@
-"""
-chrome_analyzer.py  --  standalone Chrome / Chromium analysis engine.
-
-No GUI code, no drive detection, no browser detection. Your GUI calls ONE function
-with the two dropdown values:
-
-    from chrome_analyzer import analyze_chrome
-
-    result = analyze_chrome(selected_drive, selected_browser, log_callback=None)
-
-    selected_drive   : value of the 1st dropdown, e.g. "D:\\"
-    selected_browser : value of the 2nd dropdown, e.g. "Google Chrome"
-    log_callback     : optional function(str) that receives each log line live
-                       (call it from a worker thread and marshal to your GUI thread)
-
-It returns an AnalysisResult (see the dataclasses below). Use result.to_dict()
-for a plain dict. result.browser / result.profiles / result.summary / result.log
-hold the findings. It never raises; failures are in result.errors / result.warnings.
-
-Forensic handling:
-  * All paths are derived from selected_drive; the live registry and environment
-    variables are NOT used, so the same code works on a mounted image later.
-  * Read-only: History is copied to a temp folder and the COPY is queried (the
-    copy is deleted afterwards). If the copy fails because Chrome has the file
-    locked, a read-only "immutable" open is tried and a warning is logged.
-  * Nothing is written to the source drive. Chrome is never launched.
-  * A missing artifact is reported as unavailable, never as proof of non-use.
-"""
-
+# analysis/chrome_analyzer.py
 import ctypes
 import hashlib
 import json
@@ -43,28 +15,20 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-# ================================================================== models
 @dataclass(frozen=True)
 class BrowserSpec:
-    """Where a Chromium-family browser lives, relative to a drive root.
-
-    Adding Edge/Brave later = adding another BrowserSpec with its own paths.
-    """
     name: str
     exe_name: str
-    system_install_dirs: tuple      # relative to drive root
-    per_user_install_dirs: tuple    # relative to Users\<user>
-    per_user_data_dir: str          # relative to Users\<user>
-
+    system_install_dirs: tuple
+    per_user_install_dirs: tuple
+    per_user_data_dir: str
 
 @dataclass
 class BrowserLocation:
-    """What the locator found on a drive (before any analysis)."""
     name: str
     drive: str
     executable_paths: List[str] = field(default_factory=list)
-    user_data_dirs: List[Dict[str, str]] = field(default_factory=list)  # {"windows_user", "path"}
-
+    user_data_dirs: List[Dict[str, str]] = field(default_factory=list)
 
 @dataclass
 class BrowserInfo:
@@ -77,25 +41,33 @@ class BrowserInfo:
     user_data_paths: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
-
 @dataclass
 class HistoryRecord:
     url: str
     title: str
-    visit_time: Optional[str]   # last visit of this URL, UTC string
+    visit_time: Optional[str]
     visit_count: int
     profile: str
 
-
 @dataclass
 class HistoryStatistics:
-    history_record_count: int = 0   # rows in Chrome's "urls" table
-    total_visits: int = 0           # sum of visit_count over those rows
+    history_record_count: int = 0
+    total_visits: int = 0
     unique_url_count: int = 0
     unique_domain_count: int = 0
     first_visit: Optional[str] = None
     last_visit: Optional[str] = None
 
+@dataclass
+class CookieRecord:
+    host: str
+    name: str
+    path: str
+    creation_time: Optional[str]
+    expiry_time: Optional[str]
+    is_secure: bool
+    is_httponly: bool
+    profile: str
 
 @dataclass
 class DownloadRecord:
@@ -138,11 +110,12 @@ class ProfileResult:
     metadata: Dict[str, Any] = field(default_factory=dict)
     history_db_path: Optional[str] = None
     history_status: str = "Not analyzed"
-    history_db_sha256: Optional[str] = None   # hash of the copy that was analyzed
+    history_db_sha256: Optional[str] = None
     history: List[HistoryRecord] = field(default_factory=list)
     downloads: List[DownloadRecord] = field(default_factory=list)
     statistics: HistoryStatistics = field(default_factory=HistoryStatistics)
-
+    cookie_count: int = 0
+    cookies: List[CookieRecord] = field(default_factory=list)
 
 @dataclass
 class AnalysisResult:
@@ -159,17 +132,9 @@ class AnalysisResult:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
-
-# ================================================================== utilities
-
-# Chrome stores times as microseconds since 1601-01-01 00:00:00 UTC.
 CHROME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
 
-
-# ---------------------------------------------------------------- timestamps
 def chrome_time_to_datetime(value: Any) -> Optional[datetime]:
-    """Convert a Chrome/WebKit timestamp to an aware UTC datetime.
-    Returns None for 0, negative, non-numeric or out-of-range values."""
     try:
         micros = int(value)
         if micros <= 0:
@@ -178,27 +143,16 @@ def chrome_time_to_datetime(value: Any) -> Optional[datetime]:
     except (TypeError, ValueError, OverflowError):
         return None
 
-
 def format_utc(dt: Optional[datetime]) -> Optional[str]:
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else None
-
 
 def chrome_time_to_string(value: Any) -> Optional[str]:
     return format_utc(chrome_time_to_datetime(value))
 
-
 def now_utc_string() -> str:
     return format_utc(datetime.now(timezone.utc))
 
-
-# ------------------------------------------------------------------- logging
 class AnalysisLogger:
-    """Collects timestamped log lines and optionally forwards each to a callback.
-
-    The callback is how a GUI receives live updates without the analyzer
-    knowing anything about the GUI.
-    """
-
     def __init__(self, callback: Optional[Callable[[str], None]] = None):
         self.entries: List[str] = []
         self.warnings: List[str] = []
@@ -212,7 +166,7 @@ class AnalysisLogger:
             try:
                 self._callback(line)
             except Exception:
-                pass  # a broken GUI callback must never break the analysis
+                pass
         return line
 
     def info(self, message: str) -> None:
@@ -226,10 +180,7 @@ class AnalysisLogger:
         self.errors.append(message)
         self._emit("ERROR: ", message)
 
-
-# -------------------------------------------------------------- file helpers
 def read_json_file(path: str) -> Tuple[Optional[dict], Optional[str]]:
-    """Read a JSON file. Returns (data, None) or (None, reason)."""
     if not os.path.isfile(path):
         return None, "file not found"
     try:
@@ -245,9 +196,7 @@ def read_json_file(path: str) -> Tuple[Optional[dict], Optional[str]]:
     except OSError as exc:
         return None, f"cannot be read ({exc})"
 
-
 def file_metadata(path: str) -> Optional[Dict[str, Any]]:
-    """Size and filesystem timestamps (UTC) of a file, or None if unavailable."""
     try:
         st = os.stat(path)
     except OSError:
@@ -262,9 +211,8 @@ def file_metadata(path: str) -> Optional[Dict[str, Any]]:
     return {
         "size_bytes": st.st_size,
         "modified_utc": utc(st.st_mtime),
-        "created_utc": utc(st.st_ctime),  # creation time on Windows
+        "created_utc": utc(st.st_ctime),
     }
-
 
 def sha256_file(path: str) -> Optional[str]:
     try:
@@ -276,29 +224,21 @@ def sha256_file(path: str) -> Optional[str]:
     except OSError:
         return None
 
-
 def dig(data: Any, *keys: str) -> Any:
-    """Safely read nested dict keys; returns None if any level is missing."""
     for key in keys:
         if not isinstance(data, dict):
             return None
         data = data.get(key)
     return data
 
-
 def get_domain(url: str) -> Optional[str]:
-    """Host part of a URL in lower case, or None if there is none."""
     try:
         host = urlparse(url).hostname
     except ValueError:
         return None
     return host.lower() if host else None
 
-
-# --------------------------------------------------------- executable version
 def get_file_version(path: str) -> Optional[str]:
-    """Read the version resource of an .exe (Windows only), e.g. '140.0.7339.81'.
-    Reads the file only; does not run it. Returns None if unavailable."""
     if sys.platform != "win32":
         return None
     try:
@@ -338,11 +278,6 @@ def get_file_version(path: str) -> Optional[str]:
     except Exception:
         return None
 
-
-# ============================================================ analyzer
-
-# --------------------------------------------------------------- browser specs
-# Forward slashes are fine on Windows and keep the code testable elsewhere.
 CHROME_SPEC = BrowserSpec(
     name="Google Chrome",
     exe_name="chrome.exe",
@@ -352,21 +287,16 @@ CHROME_SPEC = BrowserSpec(
     per_user_data_dir="AppData/Local/Google/Chrome/User Data",
 )
 
-# Future: add Edge / Brave / Chromium specs here.
 SUPPORTED_BROWSERS = [CHROME_SPEC]
 
-# Windows folders under \Users that are not real user accounts.
 SKIPPED_USER_DIRS = {"public", "default", "default user", "all users",
                      "defaultuser0", "desktop.ini"}
 
 PROFILE_DIR_PATTERN = re.compile(r"^(Default|Profile \d+)$", re.IGNORECASE)
 
-
 class HistoryAccessError(Exception):
-    """The History database could not be read (locked, corrupt, ...)."""
+    pass
 
-
-# ============================================================ browser locating
 def _list_windows_users(root_drive: str, logger: AnalysisLogger) -> List[str]:
     users_dir = os.path.join(root_drive, "Users")
     users: List[str] = []
@@ -386,10 +316,8 @@ def _list_windows_users(root_drive: str, logger: AnalysisLogger) -> List[str]:
         logger.warning(f"Unable to read {users_dir}: {exc}")
     return sorted(users)
 
-
 def locate_browser(root_drive: str, spec: BrowserSpec,
                    logger: AnalysisLogger) -> Optional[BrowserLocation]:
-    """Look for one browser's executables and User Data folders under root_drive."""
     executables: List[str] = []
     user_data_dirs: List[Dict[str, str]] = []
 
@@ -413,10 +341,7 @@ def locate_browser(root_drive: str, spec: BrowserSpec,
     return BrowserLocation(name=spec.name, drive=root_drive,
                            executable_paths=executables, user_data_dirs=user_data_dirs)
 
-
-# ============================================================== browser info
 def _version_from_folder(application_dir: str) -> Optional[str]:
-    """Chrome keeps a folder named like 140.0.7339.81 next to chrome.exe."""
     try:
         versions = [name for name in os.listdir(application_dir)
                     if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", name)
@@ -426,7 +351,6 @@ def _version_from_folder(application_dir: str) -> Optional[str]:
     if not versions:
         return None
     return max(versions, key=lambda v: tuple(int(p) for p in v.split(".")))
-
 
 def _build_browser_info(location: BrowserLocation, logger: AnalysisLogger) -> BrowserInfo:
     info = BrowserInfo(name=location.name,
@@ -461,8 +385,6 @@ def _build_browser_info(location: BrowserLocation, logger: AnalysisLogger) -> Br
         logger.warning("Chrome version could not be determined.")
     return info
 
-
-# ========================================================== profile discovery
 def _profile_sort_key(name: str) -> Tuple[int, int, str]:
     if name.lower() == "default":
         return (0, 0, name)
@@ -471,15 +393,8 @@ def _profile_sort_key(name: str) -> Tuple[int, int, str]:
         return (1, int(match.group(1)), name)
     return (2, 0, name)
 
-
 def _discover_profiles(windows_user: str, user_data_path: str,
                        logger: AnalysisLogger) -> List[Dict]:
-    """Find valid profile folders inside one 'User Data' directory.
-
-    Sources: the profile.info_cache section of 'Local State' plus folders named
-    Default / Profile N. A folder counts as a profile only if it contains a
-    'Preferences' or 'History' file.
-    """
     local_state, error = read_json_file(os.path.join(user_data_path, "Local State"))
     if error:
         logger.warning(f"'Local State' unavailable for user '{windows_user}': {error}")
@@ -514,8 +429,6 @@ def _discover_profiles(windows_user: str, user_data_path: str,
                          "local_state_entry": info_cache.get(name)})
     return profiles
 
-
-# ========================================================== profile metadata
 def _read_profile_metadata(spec: Dict, profile: ProfileResult, logger: AnalysisLogger) -> None:
     metadata = profile.metadata
     metadata["windows_user"] = spec["windows_user"]
@@ -531,7 +444,6 @@ def _read_profile_metadata(spec: Dict, profile: ProfileResult, logger: AnalysisL
                     datetime.fromtimestamp(active, tz=timezone.utc))
             except (OverflowError, OSError, ValueError):
                 pass
-        # Only record whether an account is linked, not the account details.
         metadata["account_info_present"] = bool(cache.get("user_name") or cache.get("gaia_name"))
 
     prefs_path = os.path.join(spec["path"], "Preferences")
@@ -552,7 +464,7 @@ def _read_profile_metadata(spec: Dict, profile: ProfileResult, logger: AnalysisL
         if download_dir:
             metadata["download_default_directory"] = download_dir
         created = chrome_time_to_string(dig(prefs, "profile", "creation_time"))
-        if created:  # only present in some Chrome versions
+        if created:
             metadata["profile_creation_time"] = created
 
     for label, filename in (("preferences_file", "Preferences"), ("history_file", "History")):
@@ -560,15 +472,12 @@ def _read_profile_metadata(spec: Dict, profile: ProfileResult, logger: AnalysisL
         if details:
             metadata[label] = details
 
-
-# ============================================================== history reading
 def _open_history(history_path: str, temp_dir: str,
                   logger: AnalysisLogger) -> Tuple[sqlite3.Connection, str, Optional[str]]:
-    """Return (connection, access_method, sha256_of_copy)."""
     copy_path = os.path.join(temp_dir, "History")
     try:
         shutil.copyfile(history_path, copy_path)
-        for suffix in ("-wal", "-journal"):  # include pending data if present
+        for suffix in ("-wal", "-journal"):
             side_file = history_path + suffix
             if os.path.isfile(side_file):
                 shutil.copyfile(side_file, copy_path + suffix)
@@ -738,7 +647,7 @@ def read_history_database(history_path: str, profile_name: str,
                     url=url or "", title=title or "",
                     visit_time=chrome_time_to_string(last_visit_time),
                     visit_count=int(visit_count or 0), profile=profile_name))
-            try:  # earliest individual visit, if the 'visits' table is usable
+            try:
                 row = connection.execute(
                     "SELECT MIN(visit_time) FROM visits WHERE visit_time > 0").fetchone()
                 first_visit = chrome_time_to_string(row[0]) if row else None
@@ -752,8 +661,30 @@ def read_history_database(history_path: str, profile_name: str,
             connection.close()
         return records, first_visit, method, sha256, downloads
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)  # removes only OUR temp copy
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
+def read_cookies_database(cookies_path: str, profile_name: str, logger: AnalysisLogger) -> Tuple[List[CookieRecord], str, Optional[str]]:
+    temp_dir = tempfile.mkdtemp(prefix="bfa_c_")
+    try:
+        connection, method, sha256 = _open_history(cookies_path, temp_dir, logger)
+        connection.text_factory = lambda raw: raw.decode("utf-8", errors="replace")
+        records = []
+        try:
+            for host, name, path, creation, expires, secure, httponly in connection.execute(
+                    "SELECT host_key, name, path, creation_utc, expires_utc, is_secure, is_httponly FROM cookies"):
+                records.append(CookieRecord(
+                    host=host or "", name=name or "", path=path or "",
+                    creation_time=chrome_time_to_string(creation),
+                    expiry_time=chrome_time_to_string(expires),
+                    is_secure=bool(secure), is_httponly=bool(httponly), profile=profile_name
+                ))
+        except sqlite3.DatabaseError as exc:
+            raise HistoryAccessError(f"database corrupted or locked ({exc})")
+        finally:
+            connection.close()
+        return records, method, sha256
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 def compute_statistics(records: List[HistoryRecord],
                        first_visit: Optional[str] = None) -> HistoryStatistics:
@@ -768,8 +699,6 @@ def compute_statistics(records: List[HistoryRecord],
         last_visit=max(times) if times else None,
     )
 
-
-# ================================================================ orchestration
 def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
     name = spec["directory_name"]
     profile = ProfileResult(directory_name=name, path=spec["path"],
@@ -803,10 +732,39 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
         logger.info(f"{name}: {len(records):,} history records, "
                     f"{profile.statistics.unique_domain_count:,} unique domains.")
     else:
-        profile.history_status = f"Read OK, no records ({method})"
-        logger.info(f"{name}: History database contains no records.")
-    return profile
+        profile.history_db_path = history_path
+        logger.info("History database found. Reading history...")
+        try:
+            records, first_visit, method, sha256, downloads = read_history_database(
+                history_path, name, logger)
+            profile.history = records
+            profile.downloads = downloads
+            logger.info(f"{name}: {len(downloads):,} download record(s).")
+            profile.history_db_sha256 = sha256
+            profile.statistics = compute_statistics(records, first_visit)
+            if records:
+                profile.history_status = f"Read OK ({method})"
+                logger.info(f"{name}: {len(records):,} history records, "
+                            f"{profile.statistics.unique_domain_count:,} unique domains.")
+            else:
+                profile.history_status = f"Read OK, no records ({method})"
+                logger.info(f"{name}: History database contains no records.")
+        except HistoryAccessError as exc:
+            profile.history_status = f"Unavailable: {exc}"
+            logger.warning(f"History database unavailable for {name}: {exc}")
 
+    cookies_paths = [os.path.join(spec["path"], "Network", "Cookies"), os.path.join(spec["path"], "Cookies")]
+    cookies_path = next((p for p in cookies_paths if os.path.isfile(p)), None)
+    if cookies_path:
+        try:
+            c_records, c_method, c_sha256 = read_cookies_database(cookies_path, name, logger)
+            profile.cookies = c_records
+            profile.cookie_count = len(c_records)
+            logger.info(f"{name}: {profile.cookie_count:,} cookies found.")
+        except HistoryAccessError as exc:
+            logger.warning(f"Cookies database unavailable for {name}: {exc}")
+
+    return profile
 
 def _build_summary(profiles: List[ProfileResult]) -> Dict:
     all_records = [r for p in profiles for r in p.history]
@@ -823,6 +781,7 @@ def _build_summary(profiles: List[ProfileResult]) -> Dict:
         "first_visit": min(firsts) if firsts else None,
         "last_visit": stats.last_visit,
         "download_count": sum(len(p.downloads) for p in profiles),
+        "cookie_count": sum(p.cookie_count for p in profiles),
     }
 
 def _locate_specific_browser(root_drive: str, exe_path: str, spec: BrowserSpec, logger: AnalysisLogger) -> BrowserLocation:
@@ -890,10 +849,7 @@ def _run_analysis(root_drive: str, target_exe_path: Optional[str],
     result.summary = _build_summary(result.profiles)
     logger.info("Analysis completed.")
 
-
-# ================================================================ public entry point
 SUPPORTED_BROWSER_NAMES = {"google chrome", "chrome"}
-
 
 def analyze_chrome(selected_drive: str, selected_browser: str = "Google Chrome",
                    target_exe_path: Optional[str] = None,
@@ -915,9 +871,7 @@ def analyze_chrome(selected_drive: str, selected_browser: str = "Google Chrome",
     result.finished_utc = now_utc_string()
     return result
 
-
 if __name__ == "__main__":
-    # Quick command-line check:  python chrome_analyzer.py D:\\
     drive = sys.argv[1] if len(sys.argv) > 1 else "C:\\"
     outcome = analyze_chrome(drive, "Google Chrome", log_callback=print)
     print(json.dumps(outcome.summary, indent=2))

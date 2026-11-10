@@ -1,48 +1,4 @@
-"""
-brave_analyzer.py  --  standalone Brave browser analysis engine (per installation).
-
-    from brave_analyzer import analyze_brave
-
-    result = analyze_brave(selected_drive, selected_browser, target_exe_path,
-                           log_callback=None)
-
-    selected_drive   : e.g. "D:\\"
-    selected_browser : "Brave" (also "Brave Browser", "Brave Beta", "Brave Nightly", "Brave Dev")
-    target_exe_path  : full path of the EXACT brave.exe to analyse,
-                       e.g. "D:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"
-    log_callback     : optional function(str) receiving each log line live
-
-It never raises; failures are in result.errors / result.warnings.
-
-WHAT IT REPORTS (only for the installation given in target_exe_path)
-    result.summary["profile_count"], ["profile_names"]
-    result.summary["unique_url_count"], ["unique_domain_count"], ["bookmark_count"],
-                   ["download_count"], ["extension_count"], ["total_visits"]
-    result.websites_visited()   -> every website visit with its time (newest first)
-    result.profiles[i]          -> per-profile name, path and the same counts / visits
-
-HOW PROFILES ARE TIED TO THE INSTALLATION
-    Unlike Firefox, Chromium browsers keep NO link between an installation and a
-    profile. Profiles live in a "User Data" folder that is chosen by CHANNEL and USER:
-        ...\\BraveSoftware\\Brave-Browser\\User Data          (release)
-        ...\\BraveSoftware\\Brave-Browser-Beta\\User Data     (Beta), -Nightly, -Dev
-    So the exe path decides:
-      * channel   : taken from the install folder name (Brave-Browser / -Beta / ...),
-                    so a Beta install never reports release profiles and vice versa.
-      * owner     : an install inside Users\\<name>\\... is a per-user install, so only
-                    that user's data is read; a system-wide install (Program Files)
-                    reads every user's data folder for that channel.
-      * portable  : a "User Data" folder next to the exe is used on its own.
-    LIMIT: two installs of the SAME channel for the same user (e.g. system-wide and
-    per-user) share one User Data folder and cannot be separated by any method; the
-    analyzer logs a warning when it detects this.
-
-Forensic handling: paths derive from selected_drive only; the History database is
-COPIED (with its -journal/-wal) to a temp folder and the copy is queried; nothing is
-written to the source drive; Brave is never launched. A missing artifact is reported
-as unavailable, never as proof of non-use.
-"""
-
+# analysis/brave_analyzer.py
 import hashlib
 import json
 import ntpath
@@ -58,27 +14,34 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-
-# ================================================================== models
 @dataclass
 class BrowserInfo:
     name: str
-    channel: Optional[str] = None               # e.g. "Brave-Browser", "Brave-Browser-Beta"
+    channel: Optional[str] = None
     version: Optional[str] = None
     executable_path: Optional[str] = None
     installation_path: Optional[str] = None
     executable_exists: bool = False
-    install_scope: Optional[str] = None         # "system-wide" | "per-user (<name>)" | "portable"
+    install_scope: Optional[str] = None
     user_data_paths: List[str] = field(default_factory=list)
-
 
 @dataclass
 class VisitRecord:
     url: str
     title: str
-    visit_time: Optional[str]       # UTC
+    visit_time: Optional[str]
     profile: str
 
+@dataclass
+class CookieRecord:
+    host: str
+    name: str
+    path: str
+    creation_time: Optional[str]
+    expiry_time: Optional[str]
+    is_secure: bool
+    is_httponly: bool
+    profile: str
 
 @dataclass
 class DownloadRecord:
@@ -114,13 +77,13 @@ class DownloadRecord:
 
 @dataclass
 class ProfileResult:
-    directory_name: str                         # "Default", "Profile 1", ...
+    directory_name: str
     path: str
     windows_user: str
-    profile_name: str = ""                      # name shown in Brave (e.g. "Person 1")
+    profile_name: str = ""
     attribution_basis: str = ""
     history_status: str = "Not analyzed"
-    history_db_sha256: Optional[str] = None     # hash of the analysed copy of History
+    history_db_sha256: Optional[str] = None
     visits: List[VisitRecord] = field(default_factory=list)
     visit_count: int = 0
     unique_url_count: int = 0
@@ -129,13 +92,14 @@ class ProfileResult:
     download_count: int = 0
     extension_count: int = 0
     downloads: List[DownloadRecord] = field(default_factory=list)
-
+    cookie_count: int = 0
+    cookies: List[CookieRecord] = field(default_factory=list)
 
 @dataclass
 class AnalysisResult:
     drive: str
     browser: Optional[BrowserInfo] = None
-    profiles: List[ProfileResult] = field(default_factory=list)   # THIS installation only
+    profiles: List[ProfileResult] = field(default_factory=list)
     summary: Dict[str, Any] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
@@ -147,24 +111,17 @@ class AnalysisResult:
         return asdict(self)
 
     def websites_visited(self) -> List[Dict[str, Any]]:
-        """Every website visit across the installation's profiles, newest first.
-        Each item: {"profile", "url", "title", "visit_time"} (visit_time is UTC)."""
         rows = [{"profile": v.profile, "url": v.url, "title": v.title, "visit_time": v.visit_time}
                 for p in self.profiles for v in p.visits]
         rows.sort(key=lambda r: r["visit_time"] or "", reverse=True)
         return rows
 
-
-# ================================================================== utilities
-CHROME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)   # Chromium time base
-
+CHROME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
 
 def format_utc(dt: Optional[datetime]) -> Optional[str]:
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else None
 
-
 def chrome_time_to_string(value: Any) -> Optional[str]:
-    """Chromium timestamp: microseconds since 1601-01-01 UTC. None if invalid."""
     try:
         micros = int(value)
         if micros <= 0:
@@ -173,14 +130,10 @@ def chrome_time_to_string(value: Any) -> Optional[str]:
     except (TypeError, ValueError, OverflowError):
         return None
 
-
 def now_utc_string() -> str:
     return format_utc(datetime.now(timezone.utc))
 
-
 class AnalysisLogger:
-    """Collects timestamped log lines and forwards each to an optional callback."""
-
     def __init__(self, callback: Optional[Callable[[str], None]] = None):
         self.entries: List[str] = []
         self.warnings: List[str] = []
@@ -194,7 +147,7 @@ class AnalysisLogger:
             try:
                 self._callback(line)
             except Exception:
-                pass  # a broken GUI callback must never break the analysis
+                pass
 
     def info(self, message: str) -> None:
         self._emit("", message)
@@ -206,7 +159,6 @@ class AnalysisLogger:
     def error(self, message: str) -> None:
         self.errors.append(message)
         self._emit("ERROR: ", message)
-
 
 def read_json_file(path: str) -> Tuple[Optional[Any], Optional[str]]:
     if not os.path.isfile(path):
@@ -221,7 +173,6 @@ def read_json_file(path: str) -> Tuple[Optional[Any], Optional[str]]:
     except (OSError, UnicodeDecodeError) as exc:
         return None, f"cannot be read ({exc})"
 
-
 def sha256_file(path: str) -> Optional[str]:
     try:
         digest = hashlib.sha256()
@@ -232,14 +183,12 @@ def sha256_file(path: str) -> Optional[str]:
     except OSError:
         return None
 
-
 def dig(data: Any, *keys: str) -> Any:
     for key in keys:
         if not isinstance(data, dict):
             return None
         data = data.get(key)
     return data
-
 
 def get_domain(url: str) -> Optional[str]:
     try:
@@ -248,8 +197,6 @@ def get_domain(url: str) -> Optional[str]:
         return None
     return host.lower() if host else None
 
-
-# ============================================================ locating
 BRAVE_VENDOR_DIR = "BraveSoftware"
 EXE_NAME = "brave.exe"
 CHANNELS = ("Brave-Browser", "Brave-Browser-Beta", "Brave-Browser-Nightly", "Brave-Browser-Dev")
@@ -260,10 +207,8 @@ SUPPORTED_BROWSER_NAMES = {"brave", "brave browser", "brave-browser", "brave bet
 SKIPPED_USER_DIRS = {"public", "default", "default user", "all users", "defaultuser0", "desktop.ini"}
 PROFILE_DIR_PATTERN = re.compile(r"^(Default|Profile \d+)$", re.IGNORECASE)
 
-
 class HistoryAccessError(Exception):
-    """The History database could not be read (locked, corrupt, ...)."""
-
+    pass
 
 def _list_windows_users(root_drive: str, logger: AnalysisLogger) -> List[str]:
     users_dir = os.path.join(root_drive, "Users")
@@ -284,9 +229,7 @@ def _list_windows_users(root_drive: str, logger: AnalysisLogger) -> List[str]:
         logger.warning(f"Unable to read {users_dir}: {exc}")
     return sorted(users)
 
-
 def discover_brave_installations(root_drive: str, logger: Optional[AnalysisLogger] = None) -> List[str]:
-    """brave.exe paths found in standard locations (for a GUI dropdown)."""
     logger = logger or AnalysisLogger()
     found: List[str] = []
     for program_dir in ("Program Files", "Program Files (x86)"):
@@ -304,18 +247,14 @@ def discover_brave_installations(root_drive: str, logger: Optional[AnalysisLogge
                 found.append(candidate)
     return found
 
-
 def _detect_channel(exe_path: str) -> Optional[str]:
-    """Channel folder name taken from the exe path, e.g. 'Brave-Browser-Beta'."""
     for part in reversed(Path(exe_path.replace("\\", "/")).parts):
         for channel in CHANNELS:
             if part.lower() == channel.lower():
                 return channel
     return None
 
-
 def _install_owner(exe_path: str, root_drive: str) -> Optional[str]:
-    """Windows user that owns a per-user install (exe under Users\\<name>\\), else None."""
     try:
         parts = Path(os.path.relpath(exe_path, root_drive)).parts
     except ValueError:
@@ -324,16 +263,13 @@ def _install_owner(exe_path: str, root_drive: str) -> Optional[str]:
         return parts[1]
     return None
 
-
 def _version_from_folder(application_dir: str) -> Optional[str]:
-    """Brave keeps a folder named like 1.81.131 / 140.1.82.166 next to brave.exe."""
     try:
         versions = [n for n in os.listdir(application_dir)
                     if re.fullmatch(r"\d+(\.\d+){2,3}", n) and os.path.isdir(os.path.join(application_dir, n))]
     except OSError:
         return None
     return max(versions, key=lambda v: tuple(int(p) for p in v.split("."))) if versions else None
-
 
 def _build_browser_info(exe_path: str, root_drive: str, logger: AnalysisLogger) -> BrowserInfo:
     info = BrowserInfo(name="Brave", executable_path=exe_path, executable_exists=os.path.isfile(exe_path),
@@ -346,19 +282,14 @@ def _build_browser_info(exe_path: str, root_drive: str, logger: AnalysisLogger) 
         logger.info(f"Brave version: {info.version}")
     return info
 
-
-# ============================================================ profile discovery
 def _profile_sort_key(name: str) -> Tuple[int, int, str]:
     if name.lower() == "default":
         return (0, 0, name)
     m = re.fullmatch(r"Profile (\d+)", name, re.IGNORECASE)
     return (1, int(m.group(1)), name) if m else (2, 0, name)
 
-
 def _discover_profiles(windows_user: str, user_data_path: str, basis: str,
                        logger: AnalysisLogger) -> List[Dict]:
-    """Valid profile folders inside one 'User Data' directory (Local State + Default/Profile N).
-    A folder counts only if it holds a 'Preferences' or 'History' file."""
     local_state, error = read_json_file(os.path.join(user_data_path, "Local State"))
     if error:
         logger.warning(f"'Local State' unavailable for '{windows_user}': {error}")
@@ -393,13 +324,10 @@ def _discover_profiles(windows_user: str, user_data_path: str, basis: str,
                          "basis": basis})
     return profiles
 
-
 def _locate_user_data(root_drive: str, exe_path: str, info: BrowserInfo,
                       logger: AnalysisLogger) -> List[Tuple[str, str, str]]:
-    """Return [(windows_user, user_data_path, basis)] belonging to THIS installation."""
     exe_dir = os.path.dirname(exe_path)
     candidates = [os.path.join(exe_dir, "User Data")]
-    # ...\\Brave-Browser\\User Data is the STANDARD per-user location, not a portable layout
     if BRAVE_VENDOR_DIR.lower() not in exe_path.replace("\\", "/").lower():
         candidates.append(os.path.join(os.path.dirname(exe_dir), "User Data"))
     for portable in candidates:
@@ -429,7 +357,6 @@ def _locate_user_data(root_drive: str, exe_path: str, info: BrowserInfo,
             found.append((user, data_dir, f"{channel} User Data of user '{user}' "
                                           f"({info.install_scope} install)"))
 
-    # Chromium cannot separate two installs of the same channel that share a User Data folder.
     others = [e for e in discover_brave_installations(root_drive)
               if os.path.normcase(e) != os.path.normcase(exe_path) and _detect_channel(e) == channel]
     for other in others:
@@ -441,11 +368,8 @@ def _locate_user_data(root_drive: str, exe_path: str, info: BrowserInfo,
             break
     return found
 
-
-# ============================================================ database access
 def _with_history(source: str, logger: AnalysisLogger,
                   reader: Callable[[sqlite3.Connection], Any]) -> Tuple[Any, str, Optional[str]]:
-    """Run reader on a COPY of the History database (plus -journal / -wal)."""
     temp_dir = tempfile.mkdtemp(prefix="bfa_brave_")
     try:
         copy_path = os.path.join(temp_dir, "History")
@@ -479,8 +403,7 @@ def _with_history(source: str, logger: AnalysisLogger,
         finally:
             connection.close()
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)   # removes only OUR temp copy
-
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 def _columns(connection: sqlite3.Connection, table: str) -> set:
     try:
@@ -488,12 +411,7 @@ def _columns(connection: sqlite3.Connection, table: str) -> set:
     except sqlite3.Error:
         return set()
 
-
 def _read_history(connection: sqlite3.Connection, profile: str, logger: AnalysisLogger) -> Dict[str, Any]:
-    """Visits (one row per visit, with time) plus the download count.
-
-    Hidden URLs and sub-frame visits (transition types 4 and 5) are excluded, matching
-    what Brave's own History page shows."""
     url_cols = _columns(connection, "urls")
     has_visits = bool(_columns(connection, "visits"))
     hidden = " AND u.hidden = 0" if "hidden" in url_cols else ""
@@ -506,7 +424,6 @@ def _read_history(connection: sqlite3.Connection, profile: str, logger: Analysis
             visits.append(VisitRecord(url or "", title or "", chrome_time_to_string(when), profile))
     else:
         logger.warning(f"'visits' table unavailable for {profile}; using last-visit times only.")
-    # URLs with a visit counter but no individual visit rows
     extra = ("SELECT u.url, u.title, u.last_visit_time FROM urls u WHERE u.visit_count > 0" + hidden)
     if has_visits:
         extra += " AND u.id NOT IN (SELECT url FROM visits)"
@@ -519,6 +436,7 @@ def _read_history(connection: sqlite3.Connection, profile: str, logger: Analysis
         downloads = int(connection.execute("SELECT COUNT(*) FROM downloads").fetchone()[0] or 0)
     except sqlite3.Error as exc:
         logger.warning(f"Download records unavailable for {profile}: {exc}")
+
     return {"visits": visits, "downloads": downloads,
             "download_records": read_downloads(connection, profile, logger)}
 
@@ -651,6 +569,71 @@ def read_downloads(connection: sqlite3.Connection, profile_name: str,
         logger.warning(f"Downloads could not be fully read for {profile_name}: {exc}")
     return records
 
+def read_downloads(connection: sqlite3.Connection, profile_name: str,
+                   logger: AnalysisLogger) -> List[DownloadRecord]:
+    try:
+        available = {row[1] for row in connection.execute("PRAGMA table_info(downloads)")}
+    except sqlite3.Error as exc:
+        logger.warning(f"Could not inspect downloads table for {profile_name}: {exc}")
+        return []
+    if not available:
+        logger.info(f"{profile_name}: no 'downloads' table in History database.")
+        return []
+
+    columns = [c for c in _DOWNLOAD_COLUMNS if c in available]
+    query = f"SELECT {', '.join(columns)} FROM downloads"
+    if "start_time" in available:
+        query += " ORDER BY start_time DESC"
+
+    chains: Dict[int, List[str]] = {}
+    try:
+        for dl_id, url in connection.execute(
+                "SELECT id, url FROM downloads_url_chains ORDER BY id, chain_index"):
+            chains.setdefault(dl_id, []).append(url or "")
+    except sqlite3.Error:
+        logger.warning(f"'downloads_url_chains' unavailable for {profile_name}; "
+                       "download source URLs may be missing.")
+
+    records: List[DownloadRecord] = []
+    try:
+        for values in connection.execute(query):
+            row = dict(zip(columns, values))
+            chain = chains.get(row.get("id"), [])
+            target = row.get("target_path") or ""
+            current = row.get("current_path") or ""
+            url = chain[-1] if chain else ""
+            records.append(DownloadRecord(
+                download_id=row.get("id"),
+                guid=row.get("guid") or "",
+                file_name=_download_file_name(target, current, url),
+                target_path=target,
+                current_path=current,
+                url=url,
+                url_chain=chain,
+                referrer=row.get("referrer") or "",
+                site_url=row.get("site_url") or "",
+                tab_url=row.get("tab_url") or "",
+                tab_referrer_url=row.get("tab_referrer_url") or "",
+                start_time=chrome_time_to_string(row.get("start_time")),
+                end_time=chrome_time_to_string(row.get("end_time")),
+                last_access_time=chrome_time_to_string(row.get("last_access_time")),
+                received_bytes=int(row.get("received_bytes") or 0),
+                total_bytes=int(row.get("total_bytes") or 0),
+                state=_enum_label(DOWNLOAD_STATES, row.get("state")),
+                danger_type=_enum_label(DANGER_TYPES, row.get("danger_type")),
+                interrupt_reason=_enum_label(INTERRUPT_REASONS, row.get("interrupt_reason")),
+                opened=bool(row.get("opened")),
+                mime_type=row.get("mime_type") or "",
+                original_mime_type=row.get("original_mime_type") or "",
+                etag=row.get("etag") or "",
+                last_modified=row.get("last_modified") or "",
+                http_method=row.get("http_method") or "",
+                by_extension=row.get("by_ext_name") or "",
+                profile=profile_name,
+            ))
+    except sqlite3.Error as exc:
+        logger.warning(f"Downloads could not be fully read for {profile_name}: {exc}")
+    return records
 
 def _count_bookmarks(profile_path: str, profile: str, logger: AnalysisLogger) -> int:
     data, error = read_json_file(os.path.join(profile_path, "Bookmarks"))
@@ -671,9 +654,7 @@ def _count_bookmarks(profile_path: str, profile: str, logger: AnalysisLogger) ->
         return 0
     return sum(count(node) for node in roots.values())
 
-
 def _read_preferences(profile_path: str, profile: str, logger: AnalysisLogger) -> Tuple[Optional[str], int]:
-    """(profile name from Preferences, number of entries in extensions.settings)."""
     prefs, error = read_json_file(os.path.join(profile_path, "Preferences"))
     if error:
         logger.warning(f"Preferences unavailable for {profile}: {error}")
@@ -682,8 +663,21 @@ def _read_preferences(profile_path: str, profile: str, logger: AnalysisLogger) -
     count = sum(1 for value in settings.values() if isinstance(value, dict)) if isinstance(settings, dict) else 0
     return dig(prefs, "profile", "name") or None, count
 
+def _read_cookies(connection: sqlite3.Connection, profile: str) -> List[CookieRecord]:
+    records = []
+    try:
+        for host, name, path, creation, expires, secure, httponly in connection.execute(
+                "SELECT host_key, name, path, creation_utc, expires_utc, is_secure, is_httponly FROM cookies"):
+            records.append(CookieRecord(
+                host=host or "", name=name or "", path=path or "",
+                creation_time=chrome_time_to_string(creation),
+                expiry_time=chrome_time_to_string(expires),
+                is_secure=bool(secure), is_httponly=bool(httponly), profile=profile
+            ))
+    except sqlite3.Error:
+        pass
+    return records
 
-# ============================================================ orchestration
 def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
     directory = spec["directory_name"]
     prefs_name, extension_count = _read_preferences(spec["path"], directory, logger)
@@ -698,13 +692,33 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
     if not os.path.isfile(history_path):
         profile.history_status = "Not found"
         logger.warning(f"History database not found for {directory} (unavailable, not proof of no browsing).")
-        return profile
-    try:
-        data, method, digest = _with_history(history_path, logger, lambda c: _read_history(c, directory, logger))
-    except HistoryAccessError as exc:
-        profile.history_status = f"Unavailable: {exc}"
-        logger.warning(f"History database unavailable for {directory}: {exc}")
-        return profile
+    else:
+        try:
+            data, method, digest = _with_history(history_path, logger, lambda c: _read_history(c, directory, logger))
+            profile.visits = data["visits"]
+            profile.history_db_sha256 = digest
+            profile.download_count = data["downloads"]
+            profile.downloads = data["download_records"]
+            profile.visit_count = len(profile.visits)
+            profile.unique_url_count = len({v.url for v in profile.visits})
+            profile.unique_domain_count = len({get_domain(v.url) for v in profile.visits} - {None})
+            profile.history_status = f"Read OK ({method})" if profile.visits else f"Read OK, no records ({method})"
+            logger.info(f"{directory}: {profile.visit_count:,} visits, {profile.unique_url_count:,} unique URLs, "
+                        f"{profile.unique_domain_count:,} unique domains.")
+        except HistoryAccessError as exc:
+            profile.history_status = f"Unavailable: {exc}"
+            logger.warning(f"History database unavailable for {directory}: {exc}")
+
+    cookies_paths = [os.path.join(spec["path"], "Network", "Cookies"), os.path.join(spec["path"], "Cookies")]
+    cookies_path = next((p for p in cookies_paths if os.path.isfile(p)), None)
+    if cookies_path:
+        try:
+            c_data, c_method, c_digest = _with_history(cookies_path, logger, lambda c: _read_cookies(c, directory))
+            profile.cookies = c_data
+            profile.cookie_count = len(c_data)
+            logger.info(f"{directory}: {profile.cookie_count:,} cookies found.")
+        except HistoryAccessError as exc:
+            logger.warning(f"Cookies database unavailable for {directory}: {exc}")
 
     profile.visits = data["visits"]
     profile.history_db_sha256 = digest
@@ -717,7 +731,6 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
     logger.info(f"{directory}: {profile.visit_count:,} visits, {profile.unique_url_count:,} unique URLs, "
                 f"{profile.unique_domain_count:,} unique domains.")
     return profile
-
 
 def _build_summary(info: BrowserInfo, profiles: List[ProfileResult]) -> Dict:
     visits = [v for p in profiles for v in p.visits]
@@ -733,9 +746,9 @@ def _build_summary(info: BrowserInfo, profiles: List[ProfileResult]) -> Dict:
         "bookmark_count": sum(p.bookmark_count for p in profiles),
         "download_count": sum(p.download_count for p in profiles),
         "extension_count": sum(p.extension_count for p in profiles),
+        "cookie_count": sum(p.cookie_count for p in profiles),
         "total_visits": len(visits),
     }
-
 
 def _run_analysis(root_drive: str, exe_path: str, logger: AnalysisLogger, result: AnalysisResult) -> None:
     if not root_drive or not os.path.isdir(root_drive):
@@ -772,15 +785,9 @@ def _run_analysis(root_drive: str, exe_path: str, logger: AnalysisLogger, result
     result.summary = _build_summary(info, result.profiles)
     logger.info("Analysis completed.")
 
-
-# ================================================================ public entry points
 def analyze_brave(selected_drive: str, selected_browser: str = "Brave",
                   target_exe_path: Optional[str] = None,
                   log_callback: Optional[Callable[[str], None]] = None) -> AnalysisResult:
-    """Analyse ONE Brave installation (target_exe_path) and only its profiles.
-
-    If target_exe_path is None, standard locations are searched and the analysis
-    proceeds only when exactly ONE installation is found (installations are never merged)."""
     logger = AnalysisLogger(callback=log_callback)
     result = AnalysisResult(drive=selected_drive, started_utc=now_utc_string())
     try:
@@ -811,17 +818,13 @@ def analyze_brave(selected_drive: str, selected_browser: str = "Brave",
     result.finished_utc = now_utc_string()
     return result
 
-
 def analyze_all_brave_installations(selected_drive: str,
                                     log_callback: Optional[Callable[[str], None]] = None
                                     ) -> List[AnalysisResult]:
-    """One INDEPENDENT AnalysisResult per installation found on the drive."""
     exes = discover_brave_installations(selected_drive) if os.path.isdir(selected_drive or "") else []
     return [analyze_brave(selected_drive, "Brave", exe, log_callback) for exe in exes]
 
-
 if __name__ == "__main__":
-    # python brave_analyzer.py D:\\ "D:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"
     drive = sys.argv[1] if len(sys.argv) > 1 else "C:\\"
     exe_arg = sys.argv[2] if len(sys.argv) > 2 else None
     outcome = analyze_brave(drive, "Brave", exe_arg, log_callback=print)

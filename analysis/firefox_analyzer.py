@@ -1,42 +1,4 @@
-"""
-firefox_analyzer.py  --  standalone Mozilla Firefox analysis engine (per installation).
-
-    from firefox_analyzer import analyze_firefox
-
-    result = analyze_firefox(selected_drive, selected_browser, target_exe_path,
-                             log_callback=None)
-
-    selected_drive   : e.g. "D:\\"
-    selected_browser : "Mozilla Firefox" (also "Firefox", "Firefox ESR",
-                       "Firefox Developer Edition", "Firefox Nightly")
-    target_exe_path  : full path of the EXACT firefox.exe to analyse
-    log_callback     : optional function(str) receiving each log line live
-
-It never raises; failures are in result.errors / result.warnings.
-
-WHAT IT REPORTS (only for the installation given in target_exe_path)
-    result.summary["profile_count"], ["profile_names"]
-    result.summary["unique_url_count"], ["unique_domain_count"], ["bookmark_count"],
-                   ["download_count"], ["extension_count"]
-    result.websites_visited()   -> every website visit with its time (newest first)
-    result.profiles[i]          -> per-profile name, path and the same counts / visits
-
-HOW A PROFILE IS TIED TO THE INSTALLATION
-    confirmed : profiles.ini / installs.ini [Install<HASH>] entry whose HASH is the
-                install hash of THIS installation, or a portable profile folder
-                next to the exe.
-    inferred  : the profile's compatibility.ini names this installation's directory,
-                or it is the legacy default profile and no [Install...] entry matches.
-    Other profiles on the drive are NOT analysed; they are only listed by name in
-    result.unattributed_profiles.
-    (For a mounted image the original drive letter is unknown, so the install hash
-    is tried under every letter A-Z.)
-
-Forensic handling: paths derive from selected_drive only; SQLite files are COPIED
-(with their -wal file, where Firefox keeps recent activity) to a temp folder and the
-copy is queried; nothing is written to the source drive; Firefox is never launched.
-"""
-
+# analysis/firefox_analyzer.py
 import configparser
 import hashlib
 import json
@@ -54,16 +16,13 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import unquote, urlparse
 
-
-# ================================================================== models
 @dataclass(frozen=True)
 class BrowserSpec:
     name: str
     exe_name: str
-    system_install_dirs: tuple      # relative to drive root
-    per_user_install_dirs: tuple    # relative to Users\<user>
-    per_user_data_dir: str          # relative to Users\<user> (profiles.ini lives here)
-
+    system_install_dirs: tuple
+    per_user_install_dirs: tuple
+    per_user_data_dir: str
 
 @dataclass
 class BrowserInfo:
@@ -73,19 +32,28 @@ class BrowserInfo:
     installation_path: Optional[str] = None
     executable_exists: bool = False
     install_path_for_hash: Optional[str] = None
-    install_hash_candidates: Dict[str, str] = field(default_factory=dict)  # letter -> HASH
+    install_hash_candidates: Dict[str, str] = field(default_factory=dict)
     matched_install_hash: Optional[str] = None
-    install_hash_match_kind: Optional[str] = None   # "exact" | "drive-letter substituted"
+    install_hash_match_kind: Optional[str] = None
     user_data_paths: List[str] = field(default_factory=list)
-
 
 @dataclass
 class VisitRecord:
     url: str
     title: str
-    visit_time: Optional[str]       # UTC
+    visit_time: Optional[str]
     profile: str
 
+@dataclass
+class CookieRecord:
+    host: str
+    name: str
+    path: str
+    creation_time: Optional[str]
+    expiry_time: Optional[str]
+    is_secure: bool
+    is_httponly: bool
+    profile: str
 
 @dataclass
 class DownloadRecord:
@@ -109,11 +77,11 @@ class ProfileResult:
     directory_name: str
     path: str
     windows_user: str
-    profile_name: str = ""                      # the name shown in Firefox (about:profiles)
-    attribution: str = "unattributed"           # confirmed | inferred | unattributed
+    profile_name: str = ""
+    attribution: str = "unattributed"
     attribution_basis: str = ""
     history_status: str = "Not analyzed"
-    history_db_sha256: Optional[str] = None     # hash of the analysed copy of places.sqlite
+    history_db_sha256: Optional[str] = None
     visits: List[VisitRecord] = field(default_factory=list)
     visit_count: int = 0
     unique_url_count: int = 0
@@ -122,14 +90,15 @@ class ProfileResult:
     download_count: int = 0
     extension_count: int = 0
     downloads: List[DownloadRecord] = field(default_factory=list)
-
+    cookie_count: int = 0
+    cookies: List[CookieRecord] = field(default_factory=list)
 
 @dataclass
 class AnalysisResult:
     drive: str
     browser: Optional[BrowserInfo] = None
-    profiles: List[ProfileResult] = field(default_factory=list)               # THIS installation
-    unattributed_profiles: List[ProfileResult] = field(default_factory=list)  # name/path only
+    profiles: List[ProfileResult] = field(default_factory=list)
+    unattributed_profiles: List[ProfileResult] = field(default_factory=list)
     summary: Dict[str, Any] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
@@ -141,24 +110,17 @@ class AnalysisResult:
         return asdict(self)
 
     def websites_visited(self) -> List[Dict[str, Any]]:
-        """Every website visit across the installation's profiles, newest first.
-        Each item: {"profile", "url", "title", "visit_time"} (visit_time is UTC)."""
         rows = [{"profile": v.profile, "url": v.url, "title": v.title, "visit_time": v.visit_time}
                 for p in self.profiles for v in p.visits]
         rows.sort(key=lambda r: r["visit_time"] or "", reverse=True)
         return rows
 
-
-# ================================================================== utilities
 UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-
 
 def format_utc(dt: Optional[datetime]) -> Optional[str]:
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else None
 
-
 def firefox_time_to_string(value: Any) -> Optional[str]:
-    """Firefox places timestamps: microseconds since 1970-01-01 UTC."""
     try:
         number = int(value)
         if number <= 0:
@@ -167,14 +129,19 @@ def firefox_time_to_string(value: Any) -> Optional[str]:
     except (TypeError, ValueError, OverflowError):
         return None
 
+def _firefox_seconds_to_string(value: Any) -> Optional[str]:
+    try:
+        number = int(value)
+        if number <= 0:
+            return None
+        return format_utc(UNIX_EPOCH + timedelta(seconds=number))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 def now_utc_string() -> str:
     return format_utc(datetime.now(timezone.utc))
 
-
 class AnalysisLogger:
-    """Collects timestamped log lines and forwards each to an optional callback."""
-
     def __init__(self, callback: Optional[Callable[[str], None]] = None):
         self.entries: List[str] = []
         self.warnings: List[str] = []
@@ -188,7 +155,7 @@ class AnalysisLogger:
             try:
                 self._callback(line)
             except Exception:
-                pass  # a broken GUI callback must never break the analysis
+                pass
 
     def info(self, message: str) -> None:
         self._emit("", message)
@@ -200,7 +167,6 @@ class AnalysisLogger:
     def error(self, message: str) -> None:
         self.errors.append(message)
         self._emit("ERROR: ", message)
-
 
 def read_text_file(path: str) -> Tuple[Optional[str], Optional[str]]:
     if not os.path.isfile(path):
@@ -218,19 +184,17 @@ def read_text_file(path: str) -> Tuple[Optional[str], Optional[str]]:
             return None, f"cannot be read ({exc})"
     return None, last_error
 
-
 def read_ini(path: str) -> Tuple[Optional[configparser.RawConfigParser], Optional[str]]:
     text, error = read_text_file(path)
     if error:
         return None, error
     parser = configparser.RawConfigParser(strict=False, delimiters=("=",), interpolation=None)
-    parser.optionxform = str  # keep key case
+    parser.optionxform = str
     try:
         parser.read_string(text)
     except configparser.Error as exc:
         return None, f"invalid INI ({exc})"
     return parser, None
-
 
 def sha256_file(path: str) -> Optional[str]:
     try:
@@ -242,7 +206,6 @@ def sha256_file(path: str) -> Optional[str]:
     except OSError:
         return None
 
-
 def get_domain(url: str) -> Optional[str]:
     try:
         host = urlparse(url).hostname
@@ -250,30 +213,20 @@ def get_domain(url: str) -> Optional[str]:
         return None
     return host.lower() if host else None
 
-
-# ============================================================ install hash
-# Firefox names the [Install<HASH>] section in profiles.ini after
-# CityHash64(<install directory as UTF-16LE>), printed as upper-case hex.
-# (Verified: "C:\Program Files\Mozilla Firefox" -> 308046B0AF4A39CB.)
 _M64 = (1 << 64) - 1
 _K0, _K1, _K2, _K3 = 0xc3a5c85c97cb3127, 0xb492b66fbe98f273, 0x9ae16a3b2f90404f, 0xc949d7c7509e6557
-
 
 def _rot(v: int, s: int) -> int:
     return v if s == 0 else ((v >> s) | (v << (64 - s))) & _M64
 
-
 def _shift_mix(v: int) -> int:
     return v ^ (v >> 47)
-
 
 def _f64(b: bytes, i: int) -> int:
     return int.from_bytes(b[i:i + 8], "little")
 
-
 def _f32(b: bytes, i: int) -> int:
     return int.from_bytes(b[i:i + 4], "little")
-
 
 def _hash_len16(u: int, v: int) -> int:
     mul = 0x9ddfea08eb382d69
@@ -283,7 +236,6 @@ def _hash_len16(u: int, v: int) -> int:
     b ^= b >> 47
     return (b * mul) & _M64
 
-
 def _weak32(w: int, x: int, y: int, z: int, a: int, b: int) -> Tuple[int, int]:
     a = (a + w) & _M64
     b = _rot((b + a + z) & _M64, 21)
@@ -292,10 +244,8 @@ def _weak32(w: int, x: int, y: int, z: int, a: int, b: int) -> Tuple[int, int]:
     b = (b + _rot(a, 44)) & _M64
     return (a + z) & _M64, (b + c) & _M64
 
-
 def _weak32_s(s: bytes, i: int, a: int, b: int) -> Tuple[int, int]:
     return _weak32(_f64(s, i), _f64(s, i + 8), _f64(s, i + 16), _f64(s, i + 24), a, b)
-
 
 def _len0to16(s: bytes, n: int) -> int:
     if n > 8:
@@ -310,7 +260,6 @@ def _len0to16(s: bytes, n: int) -> int:
         return (_shift_mix(((y * _K2) & _M64) ^ ((z * _K3) & _M64)) * _K2) & _M64
     return _K2
 
-
 def _len17to32(s: bytes, n: int) -> int:
     a = (_f64(s, 0) * _K1) & _M64
     b = _f64(s, 8)
@@ -318,7 +267,6 @@ def _len17to32(s: bytes, n: int) -> int:
     d = (_f64(s, n - 16) * _K0) & _M64
     return _hash_len16((_rot((a - b) & _M64, 43) + _rot(c, 30) + d) & _M64,
                        (a + _rot(b ^ _K3, 20) - c + n) & _M64)
-
 
 def _len33to64(s: bytes, n: int) -> int:
     z = _f64(s, 24)
@@ -339,7 +287,6 @@ def _len33to64(s: bytes, n: int) -> int:
     wf, ws = (a + z) & _M64, (b + _rot(a, 31) + c) & _M64
     r = _shift_mix((((vf + ws) & _M64) * _K2 + ((wf + vs) & _M64) * _K0) & _M64)
     return (_shift_mix((r * _K0 + vs) & _M64) * _K2) & _M64
-
 
 def city_hash64(data: bytes) -> int:
     n = len(data)
@@ -371,14 +318,11 @@ def city_hash64(data: bytes) -> int:
     return _hash_len16((_hash_len16(v[0], w[0]) + _shift_mix(y) * _K1 + z) & _M64,
                        (_hash_len16(v[1], w[1]) + x) & _M64)
 
-
 def firefox_install_hash(windows_install_dir: str) -> str:
     return "%016X" % city_hash64(windows_install_dir.encode("utf-16-le"))
 
-
 def compute_install_hash_candidates(install_dir: str, root_drive: str
                                     ) -> Tuple[Optional[str], Dict[str, str], Optional[str]]:
-    """Return (drive_relative_path, {letter: HASH}, exact_letter)."""
     drive_letter = None
     match = re.match(r"^([A-Za-z]):", root_drive or "")
     if match:
@@ -398,8 +342,6 @@ def compute_install_hash_candidates(install_dir: str, root_drive: str
     return relative, {letter: firefox_install_hash(f"{letter}:\\{relative}")
                       for letter in string.ascii_uppercase}, drive_letter
 
-
-# ============================================================ browser specs
 FIREFOX_SPEC = BrowserSpec(
     name="Mozilla Firefox",
     exe_name="firefox.exe",
@@ -427,12 +369,9 @@ SKIPPED_USER_DIRS = {"public", "default", "default user", "all users",
 
 PROFILE_MARKERS = ("prefs.js", "places.sqlite", "times.json", "compatibility.ini")
 
-
 class DatabaseAccessError(Exception):
-    """A SQLite database could not be read (locked, corrupt, ...)."""
+    pass
 
-
-# ============================================================ locating
 def _list_windows_users(root_drive: str, logger: AnalysisLogger) -> List[str]:
     users_dir = os.path.join(root_drive, "Users")
     users: List[str] = []
@@ -452,10 +391,8 @@ def _list_windows_users(root_drive: str, logger: AnalysisLogger) -> List[str]:
         logger.warning(f"Unable to read {users_dir}: {exc}")
     return sorted(users)
 
-
 def discover_firefox_installations(root_drive: str,
                                    logger: Optional[AnalysisLogger] = None) -> List[str]:
-    """firefox.exe paths found in standard locations. Each is an independent installation."""
     logger = logger or AnalysisLogger()
     found: List[str] = []
     for relative in FIREFOX_SPEC.system_install_dirs:
@@ -469,7 +406,6 @@ def discover_firefox_installations(root_drive: str,
             if os.path.isfile(candidate):
                 found.append(candidate)
     return found
-
 
 def _build_browser_info(exe_path: str, root_drive: str, logger: AnalysisLogger) -> BrowserInfo:
     info = BrowserInfo(name=FIREFOX_SPEC.name, executable_path=exe_path,
@@ -489,19 +425,13 @@ def _build_browser_info(exe_path: str, root_drive: str, logger: AnalysisLogger) 
         logger.warning("Could not derive an install-relative path; install-hash matching skipped.")
     return info
 
-
-# ============================================================ profiles.ini handling
 _ABS_WIN = re.compile(r"^[A-Za-z]:[\\/]")
-
 
 def _norm_key(path: str) -> str:
     return os.path.normcase(os.path.normpath(path))
 
-
 def _resolve_profile_path(raw: str, is_relative: Optional[bool], firefox_root: str,
                           root_drive: str) -> str:
-    """Resolve a Path= value. Absolute Windows paths are re-mapped onto root_drive so a
-    mounted image never resolves to the LIVE system's files."""
     raw = raw.strip()
     norm = raw.replace("\\", "/")
     if is_relative is None:
@@ -518,20 +448,15 @@ def _resolve_profile_path(raw: str, is_relative: Optional[bool], firefox_root: s
             return candidate
     return candidates[0]
 
-
 def _is_valid_profile_dir(path: str) -> bool:
     return os.path.isdir(path) and any(os.path.isfile(os.path.join(path, m)) for m in PROFILE_MARKERS)
 
-
 def _fallback_profile_name(directory_name: str) -> str:
-    """'x1y2z3ab.default-release' -> 'default-release' (Firefox's random 8-char prefix)."""
     m = re.fullmatch(r"[a-z0-9]{8}\.(.+)", directory_name)
     return m.group(1) if m else directory_name
 
-
 def _parse_profiles_ini(firefox_root: str, root_drive: str, logger: AnalysisLogger,
                         user: str) -> Tuple[List[Dict], Dict[str, Dict]]:
-    """Return (profile_entries, install_sections{HASH: {path, locked, source}})."""
     entries: List[Dict] = []
     installs: Dict[str, Dict] = {}
 
@@ -566,9 +491,7 @@ def _parse_profiles_ini(firefox_root: str, root_drive: str, logger: AnalysisLogg
                     "source": f"installs.ini [{section}]"})
     return entries, installs
 
-
 def _compat_points_to_install(profile_path: str, install_dir: str) -> bool:
-    """Does compatibility.ini name this install directory? Drive letter and case ignored."""
     ini, _ = read_ini(os.path.join(profile_path, "compatibility.ini"))
     if not ini or not ini.has_section("Compatibility"):
         return False
@@ -581,9 +504,7 @@ def _compat_points_to_install(profile_path: str, install_dir: str) -> bool:
                 return True
     return False
 
-
 def _portable_candidates(exe_path: str) -> List[str]:
-    """Profile folders next to the exe (portable builds), nearest first."""
     exe_dir = os.path.dirname(exe_path)
     parent = os.path.dirname(exe_dir)
     grandparent = os.path.dirname(parent)
@@ -598,11 +519,9 @@ def _portable_candidates(exe_path: str) -> List[str]:
             result.append(option)
     return result
 
-
 def _collect_profile_specs(root_drive: str, exe_path: str, info: BrowserInfo,
                            logger: AnalysisLogger) -> List[Dict]:
-    """Classify every Firefox profile on the drive relative to THIS installation."""
-    specs: Dict[str, Dict] = {}   # normalized path -> spec; strongest attribution wins
+    specs: Dict[str, Dict] = {}
     rank = {"confirmed": 0, "inferred": 1, "unattributed": 2}
 
     def add(spec: Dict) -> None:
@@ -620,7 +539,7 @@ def _collect_profile_specs(root_drive: str, exe_path: str, info: BrowserInfo,
     install_dir = info.installation_path or os.path.dirname(exe_path)
     m = re.match(r"^([A-Za-z]):", root_drive or "")
     exact_letter = m.group(1).upper() if m else None
-    hash_lookup: Dict[str, Tuple[str, str]] = {}   # HASH -> (letter, kind)
+    hash_lookup: Dict[str, Tuple[str, str]] = {}
     for letter, digest in info.install_hash_candidates.items():
         kind = "exact" if letter == exact_letter else "drive-letter substituted"
         if digest not in hash_lookup or kind == "exact":
@@ -638,7 +557,6 @@ def _collect_profile_specs(root_drive: str, exe_path: str, info: BrowserInfo,
         entries, installs = _parse_profiles_ini(firefox_root, root_drive, logger, user)
         by_key = {_norm_key(e["path"]): e for e in entries}
 
-        # 1) install-hash match (exact drive letter preferred over substituted)
         matches = [(d, *hash_lookup[d]) for d in installs if d in hash_lookup]
         if any(kind == "exact" for _, _, kind in matches):
             matches = [mt for mt in matches if mt[2] == "exact"]
@@ -660,7 +578,6 @@ def _collect_profile_specs(root_drive: str, exe_path: str, info: BrowserInfo,
             matched_paths.add(_norm_key(link["path"]))
         has_install_match = bool(matched_paths)
 
-        # 2) every other profile of this user: inferred or unattributed
         known = dict(by_key)
         profiles_dir = os.path.join(firefox_root, "Profiles")
         if os.path.isdir(profiles_dir):
@@ -690,12 +607,8 @@ def _collect_profile_specs(root_drive: str, exe_path: str, info: BrowserInfo,
 
     return sorted(specs.values(), key=lambda s: (rank[s["attribution"]], s["windows_user"], s["path"]))
 
-
-# ============================================================ SQLite access
 def _with_database(source: str, logger: AnalysisLogger,
                    reader: Callable[[sqlite3.Connection], Any]) -> Tuple[Any, str, Optional[str]]:
-    """Run reader on a COPY of the database (plus its -wal / -journal). Returns
-    (reader result, access method, sha256 of the copy)."""
     temp_dir = tempfile.mkdtemp(prefix="bfa_ff_")
     try:
         copy_path = os.path.join(temp_dir, os.path.basename(source))
@@ -728,14 +641,9 @@ def _with_database(source: str, logger: AnalysisLogger,
         finally:
             connection.close()
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)   # removes only OUR temp copy
-
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 def _read_places(connection: sqlite3.Connection, profile: str, logger: AnalysisLogger) -> Dict[str, Any]:
-    """Visits (one row per visit, with time) plus bookmark and download counts.
-
-    Pages Firefox marks 'hidden' (redirect hops, embedded frames) are excluded, the same
-    as Firefox's own History window."""
     visits: List[VisitRecord] = []
     visits_table_ok = True
     try:
@@ -746,7 +654,6 @@ def _read_places(connection: sqlite3.Connection, profile: str, logger: AnalysisL
     except sqlite3.Error:
         visits_table_ok = False
         logger.warning(f"'moz_historyvisits' unavailable for {profile}; using last-visit times only.")
-    # pages that have a visit counter / last-visit time but no individual visit rows
     query = ("SELECT url, title, last_visit_date FROM moz_places WHERE hidden = 0 "
              "AND (visit_count > 0 OR last_visit_date IS NOT NULL)")
     if visits_table_ok:
@@ -756,7 +663,7 @@ def _read_places(connection: sqlite3.Connection, profile: str, logger: AnalysisL
     visits.sort(key=lambda v: v.visit_time or "", reverse=True)
 
     bookmarks = downloads = 0
-    try:   # 'place:' entries are Firefox's built-in smart folders, not real bookmarks
+    try:
         bookmarks = connection.execute(
             "SELECT COUNT(*) FROM moz_bookmarks b JOIN moz_places p ON p.id = b.fk "
             "WHERE b.type = 1 AND p.url NOT LIKE 'place:%'").fetchone()[0]
@@ -769,6 +676,7 @@ def _read_places(connection: sqlite3.Connection, profile: str, logger: AnalysisL
             "WHERE n.name = 'downloads/destinationFileURI'").fetchone()[0]
     except sqlite3.Error as exc:
         logger.warning(f"Download records unavailable for {profile}: {exc}")
+
     return {"visits": visits, "bookmarks": int(bookmarks or 0), "downloads": int(downloads or 0),
             "download_records": _read_firefox_downloads(connection, profile, logger)}
 
@@ -781,9 +689,7 @@ FIREFOX_DOWNLOAD_STATES = {
     8: "Blocked (malware / reputation)", 9: "Blocked (policy)",
 }
 
-
 def _file_uri_to_path(uri: str) -> str:
-    """'file:///C:/Users/a/Downloads/x%20y.zip' -> 'C:\\Users\\a\\Downloads\\x y.zip'."""
     if not uri:
         return ""
     lowered = uri.lower()
@@ -791,9 +697,8 @@ def _file_uri_to_path(uri: str) -> str:
         rest = unquote(uri[8:])
         return rest.replace("/", "\\") if re.match(r"^[A-Za-z]:", rest) else "/" + rest
     if lowered.startswith("file://"):
-        return "\\\\" + unquote(uri[7:]).replace("/", "\\")     # UNC path
+        return "\\\\" + unquote(uri[7:]).replace("/", "\\")
     return unquote(uri)
-
 
 def _ms_epoch_to_string(value: Any) -> Optional[str]:
     try:
@@ -804,17 +709,8 @@ def _ms_epoch_to_string(value: Any) -> Optional[str]:
     except (TypeError, ValueError, OverflowError):
         return None
 
-
 def _read_firefox_downloads(connection: sqlite3.Connection, profile: str,
                             logger: AnalysisLogger) -> List[DownloadRecord]:
-    """Downloads from an open places.sqlite connection. Never raises.
-
-    destination  : moz_annos 'downloads/destinationFileURI' (saved file)
-    metadata     : moz_annos 'downloads/metaData' JSON (state, endTime, fileSize, ...)
-    source URL   : moz_places.url of the annotated place
-    start time   : latest download-type visit (visit_type 7), else when the annotation was added
-    referrer     : the page visit that led to that download visit (from_visit)
-    """
     try:
         rows = connection.execute(
             "SELECT p.id, p.url, p.title, d.content, d.dateAdded, m.content "
@@ -881,7 +777,6 @@ def _read_firefox_downloads(connection: sqlite3.Connection, profile: str,
             profile=profile, extra=extra))
     return records
 
-
 def _count_extensions(profile_path: str, profile: str, logger: AnalysisLogger) -> int:
     path = os.path.join(profile_path, "extensions.json")
     text, error = read_text_file(path)
@@ -897,8 +792,21 @@ def _count_extensions(profile_path: str, profile: str, logger: AnalysisLogger) -
         logger.warning(f"extensions.json is not valid JSON for {profile}.")
         return 0
 
+def _read_firefox_cookies(connection: sqlite3.Connection, profile: str) -> List[CookieRecord]:
+    records = []
+    try:
+        for host, name, path, creation, expiry, secure, httponly in connection.execute(
+                "SELECT host, name, path, creationTime, expiry, isSecure, isHttpOnly FROM moz_cookies"):
+            records.append(CookieRecord(
+                host=host or "", name=name or "", path=path or "",
+                creation_time=firefox_time_to_string(creation),
+                expiry_time=_firefox_seconds_to_string(expiry),
+                is_secure=bool(secure), is_httponly=bool(httponly), profile=profile
+            ))
+    except sqlite3.Error:
+        pass
+    return records
 
-# ============================================================ orchestration
 def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
     name = spec["directory_name"]
     profile = ProfileResult(directory_name=name, path=spec["path"], windows_user=spec["windows_user"],
@@ -912,13 +820,34 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
     if not os.path.isfile(places_path):
         profile.history_status = "Not found"
         logger.warning(f"places.sqlite not found for {name} (unavailable, not proof of no browsing).")
-        return profile
-    try:
-        data, method, digest = _with_database(places_path, logger, lambda c: _read_places(c, name, logger))
-    except DatabaseAccessError as exc:
-        profile.history_status = f"Unavailable: {exc}"
-        logger.warning(f"places.sqlite unavailable for {name}: {exc}")
-        return profile
+    else:
+        try:
+            data, method, digest = _with_database(places_path, logger, lambda c: _read_places(c, name, logger))
+            profile.visits = data["visits"]
+            profile.history_db_sha256 = digest
+            profile.visit_count = len(profile.visits)
+            profile.unique_url_count = len({v.url for v in profile.visits})
+            profile.unique_domain_count = len({get_domain(v.url) for v in profile.visits} - {None})
+            profile.bookmark_count = data["bookmarks"]
+            profile.download_count = data["downloads"]
+            profile.downloads = data["download_records"]
+            profile.history_status = (f"Read OK ({method})" if profile.visits
+                                      else f"Read OK, no records ({method})")
+            logger.info(f"{name}: {profile.visit_count:,} visits, {profile.unique_url_count:,} unique URLs, "
+                        f"{profile.unique_domain_count:,} unique domains.")
+        except DatabaseAccessError as exc:
+            profile.history_status = f"Unavailable: {exc}"
+            logger.warning(f"places.sqlite unavailable for {name}: {exc}")
+
+    cookies_path = os.path.join(spec["path"], "cookies.sqlite")
+    if os.path.isfile(cookies_path):
+        try:
+            c_data, c_method, c_digest = _with_database(cookies_path, logger, lambda c: _read_firefox_cookies(c, name))
+            profile.cookies = c_data
+            profile.cookie_count = len(c_data)
+            logger.info(f"{name}: {profile.cookie_count:,} cookies found.")
+        except DatabaseAccessError as exc:
+            logger.warning(f"cookies.sqlite unavailable for {name}: {exc}")
 
     profile.visits = data["visits"]
     profile.history_db_sha256 = digest
@@ -934,7 +863,6 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
                 f"{profile.unique_domain_count:,} unique domains.")
     return profile
 
-
 def _build_summary(info: BrowserInfo, profiles: List[ProfileResult],
                    unattributed: List[ProfileResult]) -> Dict:
     visits = [v for p in profiles for v in p.visits]
@@ -949,9 +877,9 @@ def _build_summary(info: BrowserInfo, profiles: List[ProfileResult],
         "bookmark_count": sum(p.bookmark_count for p in profiles),
         "download_count": sum(p.download_count for p in profiles),
         "extension_count": sum(p.extension_count for p in profiles),
+        "cookie_count": sum(p.cookie_count for p in profiles),
         "total_visits": len(visits),
     }
-
 
 def _run_analysis(root_drive: str, exe_path: str, logger: AnalysisLogger, result: AnalysisResult) -> None:
     if not root_drive or not os.path.isdir(root_drive):
@@ -982,7 +910,7 @@ def _run_analysis(root_drive: str, exe_path: str, logger: AnalysisLogger, result
                 directory_name=spec["directory_name"], path=spec["path"], windows_user=spec["windows_user"],
                 profile_name=spec["profile_name"], attribution=spec["attribution"],
                 attribution_basis=spec["attribution_basis"], history_status=f"Analysis failed: {exc!r}"))
-    for spec in other:   # listed by name only, never analysed
+    for spec in other:
         result.unattributed_profiles.append(ProfileResult(
             directory_name=spec["directory_name"], path=spec["path"], windows_user=spec["windows_user"],
             profile_name=spec["profile_name"], attribution="unattributed",
@@ -992,15 +920,9 @@ def _run_analysis(root_drive: str, exe_path: str, logger: AnalysisLogger, result
     result.summary = _build_summary(info, result.profiles, result.unattributed_profiles)
     logger.info("Analysis completed.")
 
-
-# ================================================================ public entry points
 def analyze_firefox(selected_drive: str, selected_browser: str = "Mozilla Firefox",
                     target_exe_path: Optional[str] = None,
                     log_callback: Optional[Callable[[str], None]] = None) -> AnalysisResult:
-    """Analyse ONE Firefox installation (target_exe_path) and only its profiles.
-
-    If target_exe_path is None, standard locations are searched and the analysis
-    proceeds only when exactly ONE installation is found (installations are never merged)."""
     logger = AnalysisLogger(callback=log_callback)
     result = AnalysisResult(drive=selected_drive, started_utc=now_utc_string())
     try:
@@ -1031,17 +953,13 @@ def analyze_firefox(selected_drive: str, selected_browser: str = "Mozilla Firefo
     result.finished_utc = now_utc_string()
     return result
 
-
 def analyze_all_firefox_installations(selected_drive: str,
                                       log_callback: Optional[Callable[[str], None]] = None
                                       ) -> List[AnalysisResult]:
-    """One INDEPENDENT AnalysisResult per installation found on the drive."""
     exes = discover_firefox_installations(selected_drive) if os.path.isdir(selected_drive or "") else []
     return [analyze_firefox(selected_drive, "Mozilla Firefox", exe, log_callback) for exe in exes]
 
-
 if __name__ == "__main__":
-    # python firefox_analyzer.py D:\\ "D:\\Program Files\\Mozilla Firefox\\firefox.exe"
     import json
     drive = sys.argv[1] if len(sys.argv) > 1 else "C:\\"
     exe_arg = sys.argv[2] if len(sys.argv) > 2 else None
