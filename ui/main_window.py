@@ -352,6 +352,7 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
 
         findings_frame = QFrame()
         findings_frame.setObjectName("panel")
@@ -401,6 +402,7 @@ class MainWindow(QMainWindow):
         log_layout = QVBoxLayout(log_frame)
         log_layout.setContentsMargins(18, 16, 18, 16)
         log_layout.setSpacing(10)
+        log_frame.setMinimumWidth(350)
 
         log_title = QLabel("Analysis Log")
         log_title.setObjectName("panelTitle")
@@ -414,7 +416,9 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(findings_frame)
         splitter.addWidget(log_frame)
-        splitter.setSizes([1, 1])
+        splitter.setSizes([700, 500])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
 
         main_layout.addWidget(splitter, 1)
         self.statusBar().showMessage("Ready")
