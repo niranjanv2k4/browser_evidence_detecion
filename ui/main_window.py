@@ -395,23 +395,6 @@ class MainWindow(QMainWindow):
         findings_layout.addWidget(self.findings_output, 1)
         findings_layout.addLayout(buttons_row)
 
-        self.downloads_button = QPushButton("Downloads")
-        # Same objectName as the Websites button so it picks up the same stylesheet rules.
-        self.downloads_button.setObjectName("websitesButton")
-        self.downloads_button.setCursor(Qt.PointingHandCursor)
-        self.downloads_button.setEnabled(False)
-        self.downloads_button.clicked.connect(self._show_downloads_window)
-
-        buttons_row = QHBoxLayout()
-        buttons_row.setSpacing(10)
-        buttons_row.addWidget(self.websites_button, 1)   # equal stretch = each half the width
-        buttons_row.addWidget(self.downloads_button, 1)
-
-        findings_layout.addWidget(findings_title)
-        findings_layout.addWidget(self.findings_output, 1)  # Stretch applied here
-        findings_layout.addLayout(buttons_row)              # Websites | Downloads at the bottom
-
-
         log_frame = QFrame()
         log_frame.setObjectName("panel")
 
