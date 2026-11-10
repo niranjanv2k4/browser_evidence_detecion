@@ -1,6 +1,8 @@
 # analysis/firefox_analyzer.py
 import configparser
 import hashlib
+import json
+import ntpath
 import os
 import re
 import shutil
@@ -12,7 +14,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 @dataclass(frozen=True)
 class BrowserSpec:
@@ -43,22 +45,6 @@ class VisitRecord:
     profile: str
 
 @dataclass
-<<<<<<< Updated upstream
-=======
-class DownloadRecord:
-    download_id: Optional[int] = None
-    file_name: str = ""
-    target_path: str = ""
-    url: str = ""
-    referrer: str = ""
-    start_time: Optional[str] = None
-    end_time: Optional[str] = None
-    total_bytes: int = 0
-    state: str = "Unknown"
-    profile: str = ""
-    extra: Dict[str, str] = field(default_factory=dict)
-
-@dataclass
 class CookieRecord:
     host: str
     name: str
@@ -70,7 +56,23 @@ class CookieRecord:
     profile: str
 
 @dataclass
->>>>>>> Stashed changes
+class DownloadRecord:
+    """One download recorded in places.sqlite (moz_annos 'downloads/*' annotations).
+    Firefox stores far less than Chromium, so only these fields exist."""
+    download_id: Optional[int] = None       # moz_places.id of the downloaded URL
+    file_name: str = ""
+    target_path: str = ""                   # where the file was saved
+    url: str = ""                           # URL the file came from
+    referrer: str = ""                      # page the download was started from (if known)
+    start_time: Optional[str] = None        # UTC
+    end_time: Optional[str] = None          # UTC
+    total_bytes: int = 0
+    state: str = "Unknown"
+    profile: str = ""
+    extra: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class ProfileResult:
     directory_name: str
     path: str
@@ -87,13 +89,9 @@ class ProfileResult:
     bookmark_count: int = 0
     download_count: int = 0
     extension_count: int = 0
-<<<<<<< Updated upstream
-
-=======
     downloads: List[DownloadRecord] = field(default_factory=list)
     cookie_count: int = 0
     cookies: List[CookieRecord] = field(default_factory=list)
->>>>>>> Stashed changes
 
 @dataclass
 class AnalysisResult:
@@ -678,12 +676,13 @@ def _read_places(connection: sqlite3.Connection, profile: str, logger: AnalysisL
             "WHERE n.name = 'downloads/destinationFileURI'").fetchone()[0]
     except sqlite3.Error as exc:
         logger.warning(f"Download records unavailable for {profile}: {exc}")
-<<<<<<< Updated upstream
-    return {"visits": visits, "bookmarks": int(bookmarks or 0), "downloads": int(downloads or 0)}
-=======
+
     return {"visits": visits, "bookmarks": int(bookmarks or 0), "downloads": int(downloads or 0),
             "download_records": _read_firefox_downloads(connection, profile, logger)}
 
+
+# ============================================================ downloads
+# State values stored in the 'downloads/metaData' annotation (Firefox DownloadHistory).
 FIREFOX_DOWNLOAD_STATES = {
     1: "Complete", 2: "Failed", 3: "Cancelled", 4: "Paused", 5: "Queued",
     6: "Blocked (parental controls)", 7: "Scanning",
@@ -777,7 +776,6 @@ def _read_firefox_downloads(connection: sqlite3.Connection, profile: str,
                    if state is not None else "Unknown (no metadata)"),
             profile=profile, extra=extra))
     return records
->>>>>>> Stashed changes
 
 def _count_extensions(profile_path: str, profile: str, logger: AnalysisLogger) -> int:
     path = os.path.join(profile_path, "extensions.json")
@@ -851,7 +849,6 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
         except DatabaseAccessError as exc:
             logger.warning(f"cookies.sqlite unavailable for {name}: {exc}")
 
-<<<<<<< Updated upstream
     profile.visits = data["visits"]
     profile.history_db_sha256 = digest
     profile.visit_count = len(profile.visits)
@@ -859,12 +856,11 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
     profile.unique_domain_count = len({get_domain(v.url) for v in profile.visits} - {None})
     profile.bookmark_count = data["bookmarks"]
     profile.download_count = data["downloads"]
+    profile.downloads = data["download_records"]
     profile.history_status = (f"Read OK ({method})" if profile.visits
                               else f"Read OK, no records ({method})")
     logger.info(f"{name}: {profile.visit_count:,} visits, {profile.unique_url_count:,} unique URLs, "
                 f"{profile.unique_domain_count:,} unique domains.")
-=======
->>>>>>> Stashed changes
     return profile
 
 def _build_summary(info: BrowserInfo, profiles: List[ProfileResult],

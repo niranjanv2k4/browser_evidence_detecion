@@ -2,6 +2,7 @@
 import ctypes
 import hashlib
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -58,16 +59,26 @@ class HistoryStatistics:
     last_visit: Optional[str] = None
 
 @dataclass
-<<<<<<< Updated upstream
-=======
+class CookieRecord:
+    host: str
+    name: str
+    path: str
+    creation_time: Optional[str]
+    expiry_time: Optional[str]
+    is_secure: bool
+    is_httponly: bool
+    profile: str
+
+@dataclass
 class DownloadRecord:
+    """One row of Chrome's 'downloads' table (plus its redirect chain)."""
     download_id: Optional[int] = None
     guid: str = ""
     file_name: str = ""
-    target_path: str = ""
-    current_path: str = ""
-    url: str = ""
-    url_chain: List[str] = field(default_factory=list)
+    target_path: str = ""          # where the file was saved
+    current_path: str = ""         # in-progress / temp path (may equal target_path)
+    url: str = ""                  # final URL the file came from
+    url_chain: List[str] = field(default_factory=list)  # every URL incl. redirects
     referrer: str = ""
     site_url: str = ""
     tab_url: str = ""
@@ -86,22 +97,11 @@ class DownloadRecord:
     etag: str = ""
     last_modified: str = ""
     http_method: str = ""
-    by_extension: str = ""
+    by_extension: str = ""         # extension that triggered the download, if any
     profile: str = ""
 
-@dataclass
-class CookieRecord:
-    host: str
-    name: str
-    path: str
-    creation_time: Optional[str]
-    expiry_time: Optional[str]
-    is_secure: bool
-    is_httponly: bool
-    profile: str
 
 @dataclass
->>>>>>> Stashed changes
 class ProfileResult:
     directory_name: str
     path: str
@@ -112,6 +112,7 @@ class ProfileResult:
     history_status: str = "Not analyzed"
     history_db_sha256: Optional[str] = None
     history: List[HistoryRecord] = field(default_factory=list)
+    downloads: List[DownloadRecord] = field(default_factory=list)
     statistics: HistoryStatistics = field(default_factory=HistoryStatistics)
     cookie_count: int = 0
     cookies: List[CookieRecord] = field(default_factory=list)
@@ -491,16 +492,9 @@ def _open_history(history_path: str, temp_dir: str,
     except sqlite3.Error as exc:
         raise HistoryAccessError(f"database locked or inaccessible ({exc})")
 
-<<<<<<< Updated upstream
 
-def read_history_database(history_path: str, profile_name: str,
-                          logger: AnalysisLogger
-                          ) -> Tuple[List[HistoryRecord], Optional[str], str, Optional[str]]:
-    """Read Chrome's 'urls' table. Returns (records, first_visit, method, sha256).
-
-    One record per distinct URL; visit_time is that URL's most recent visit.
-    """
-=======
+# ============================================================ downloads reading
+# Values from Chromium's download_item / download_danger_type / download_interrupt_reason enums.
 DOWNLOAD_STATES = {0: "In progress", 1: "Complete", 2: "Cancelled",
                    3: "Interrupted", 4: "Dangerous"}
 
@@ -536,6 +530,7 @@ _DOWNLOAD_COLUMNS = (
     "last_modified", "http_method", "by_ext_name",
 )
 
+
 def _enum_label(mapping: Dict[int, str], value: Any) -> str:
     try:
         number = int(value)
@@ -543,10 +538,11 @@ def _enum_label(mapping: Dict[int, str], value: Any) -> str:
         return "Unknown"
     return mapping.get(number, f"Unknown ({number})")
 
+
 def _download_file_name(target: str, current: str, url: str) -> str:
     for path in (target, current):
         if path:
-            name = ntpath.basename(path)
+            name = ntpath.basename(path)   # handles both \\ and / separators
             if name:
                 return name
     try:
@@ -555,8 +551,12 @@ def _download_file_name(target: str, current: str, url: str) -> str:
         name = ""
     return name or "(unknown)"
 
+
 def read_downloads(connection: sqlite3.Connection, profile_name: str,
                    logger: AnalysisLogger) -> List[DownloadRecord]:
+    """Read Chrome's 'downloads' + 'downloads_url_chains' tables from an open
+    History connection. Column names differ between Chrome versions, so only
+    columns that actually exist are selected. Never raises."""
     try:
         available = {row[1] for row in connection.execute("PRAGMA table_info(downloads)")}
     except sqlite3.Error as exc:
@@ -621,17 +621,23 @@ def read_downloads(connection: sqlite3.Connection, profile_name: str,
         logger.warning(f"Downloads could not be fully read for {profile_name}: {exc}")
     return records
 
+
 def read_history_database(history_path: str, profile_name: str,
                           logger: AnalysisLogger
                           ) -> Tuple[List[HistoryRecord], Optional[str], str, Optional[str],
                                      List[DownloadRecord]]:
->>>>>>> Stashed changes
+    """Read Chrome's 'urls' and 'downloads' tables.
+    Returns (records, first_visit, method, sha256, downloads).
+
+    One record per distinct URL; visit_time is that URL's most recent visit.
+    """
     temp_dir = tempfile.mkdtemp(prefix="bfa_")
     try:
         connection, method, sha256 = _open_history(history_path, temp_dir, logger)
         connection.text_factory = lambda raw: raw.decode("utf-8", errors="replace")
         records: List[HistoryRecord] = []
         first_visit: Optional[str] = None
+        downloads: List[DownloadRecord] = []
         try:
             cursor = connection.execute(
                 "SELECT url, title, visit_count, last_visit_time FROM urls "
@@ -648,11 +654,12 @@ def read_history_database(history_path: str, profile_name: str,
             except sqlite3.Error:
                 logger.warning(f"'visits' table unavailable for {profile_name}; "
                                "first visit estimated from URL records.")
+            downloads = read_downloads(connection, profile_name, logger)
         except sqlite3.DatabaseError as exc:
             raise HistoryAccessError(f"database corrupted or locked ({exc})")
         finally:
             connection.close()
-        return records, first_visit, method, sha256
+        return records, first_visit, method, sha256, downloads
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -703,27 +710,27 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
     if not os.path.isfile(history_path):
         profile.history_status = "Not found"
         logger.warning(f"History database not found for {name} (unavailable, not proof of no browsing).")
-<<<<<<< Updated upstream
         return profile
 
     profile.history_db_path = history_path
     logger.info("History database found. Reading history...")
     try:
-        records, first_visit, method, sha256 = read_history_database(history_path, name, logger)
+        records, first_visit, method, sha256, downloads = read_history_database(
+            history_path, name, logger)
     except HistoryAccessError as exc:
         profile.history_status = f"Unavailable: {exc}"
         logger.warning(f"History database unavailable for {name}: {exc}")
         return profile
 
     profile.history = records
+    profile.downloads = downloads
+    logger.info(f"{name}: {len(downloads):,} download record(s).")
     profile.history_db_sha256 = sha256
     profile.statistics = compute_statistics(records, first_visit)
     if records:
         profile.history_status = f"Read OK ({method})"
         logger.info(f"{name}: {len(records):,} history records, "
                     f"{profile.statistics.unique_domain_count:,} unique domains.")
-=======
->>>>>>> Stashed changes
     else:
         profile.history_db_path = history_path
         logger.info("History database found. Reading history...")
@@ -773,11 +780,8 @@ def _build_summary(profiles: List[ProfileResult]) -> Dict:
         "unique_domain_count": stats.unique_domain_count,
         "first_visit": min(firsts) if firsts else None,
         "last_visit": stats.last_visit,
-<<<<<<< Updated upstream
-=======
         "download_count": sum(len(p.downloads) for p in profiles),
         "cookie_count": sum(p.cookie_count for p in profiles),
->>>>>>> Stashed changes
     }
 
 def _locate_specific_browser(root_drive: str, exe_path: str, spec: BrowserSpec, logger: AnalysisLogger) -> BrowserLocation:
