@@ -39,10 +39,13 @@ class BrowserInfo:
 
 @dataclass
 class VisitRecord:
+    """One history entry per URL (same shape as the Chrome analyzer's HistoryRecord)."""
     url: str
     title: str
-    visit_time: Optional[str]
+    visit_time: Optional[str]              # most recent visit (UTC)
     profile: str
+    first_visit_time: Optional[str] = None  # earliest visit (UTC), if known
+    visit_count: int = 1                    # number of visits to this URL
 
 @dataclass
 class CookieRecord:
@@ -83,7 +86,7 @@ class ProfileResult:
     history_status: str = "Not analyzed"
     history_db_sha256: Optional[str] = None
     visits: List[VisitRecord] = field(default_factory=list)
-    visit_count: int = 0
+    visit_count: int = 0           # total visits (sum over all URLs)
     unique_url_count: int = 0
     unique_domain_count: int = 0
     bookmark_count: int = 0
@@ -110,7 +113,9 @@ class AnalysisResult:
         return asdict(self)
 
     def websites_visited(self) -> List[Dict[str, Any]]:
-        rows = [{"profile": v.profile, "url": v.url, "title": v.title, "visit_time": v.visit_time}
+        rows = [{"profile": v.profile, "url": v.url, "title": v.title,
+                 "visit_time": v.visit_time, "first_visit_time": v.first_visit_time,
+                 "visit_count": v.visit_count}
                 for p in self.profiles for v in p.visits]
         rows.sort(key=lambda r: r["visit_time"] or "", reverse=True)
         return rows
@@ -646,20 +651,33 @@ def _with_database(source: str, logger: AnalysisLogger,
 def _read_places(connection: sqlite3.Connection, profile: str, logger: AnalysisLogger) -> Dict[str, Any]:
     visits: List[VisitRecord] = []
     visits_table_ok = True
+
+    # One record per URL: visit count + first/last visit time, aggregated from 'moz_historyvisits'.
     try:
-        for url, title, when in connection.execute(
-                "SELECT p.url, p.title, v.visit_date FROM moz_historyvisits v "
-                "JOIN moz_places p ON p.id = v.place_id WHERE p.hidden = 0"):
-            visits.append(VisitRecord(url or "", title or "", firefox_time_to_string(when), profile))
+        for url, title, count, first, last in connection.execute(
+                "SELECT p.url, p.title, COUNT(*), MIN(v.visit_date), MAX(v.visit_date) "
+                "FROM moz_historyvisits v JOIN moz_places p ON p.id = v.place_id "
+                "WHERE p.hidden = 0 GROUP BY p.id"):
+            visits.append(VisitRecord(
+                url=url or "", title=title or "",
+                visit_time=firefox_time_to_string(last),
+                first_visit_time=firefox_time_to_string(first),
+                visit_count=int(count or 0), profile=profile))
     except sqlite3.Error:
         visits_table_ok = False
         logger.warning(f"'moz_historyvisits' unavailable for {profile}; using last-visit times only.")
-    query = ("SELECT url, title, last_visit_date FROM moz_places WHERE hidden = 0 "
+
+    # Places with a counter / last-visit date but no rows in 'moz_historyvisits' (e.g. expired visits).
+    query = ("SELECT url, title, visit_count, last_visit_date FROM moz_places WHERE hidden = 0 "
              "AND (visit_count > 0 OR last_visit_date IS NOT NULL)")
     if visits_table_ok:
         query += " AND id NOT IN (SELECT place_id FROM moz_historyvisits)"
-    for url, title, when in connection.execute(query):
-        visits.append(VisitRecord(url or "", title or "", firefox_time_to_string(when), profile))
+    for url, title, count, last in connection.execute(query):
+        visits.append(VisitRecord(
+            url=url or "", title=title or "",
+            visit_time=firefox_time_to_string(last),
+            first_visit_time=None,
+            visit_count=max(int(count or 0), 1), profile=profile))
     visits.sort(key=lambda v: v.visit_time or "", reverse=True)
 
     bookmarks = downloads = 0
@@ -785,7 +803,6 @@ def _count_extensions(profile_path: str, profile: str, logger: AnalysisLogger) -
             logger.warning(f"extensions.json unavailable for {profile}: {error}")
         return 0
     try:
-        import json
         addons = json.loads(text).get("addons")
         return len(addons) if isinstance(addons, list) else 0
     except (ValueError, AttributeError):
@@ -825,7 +842,7 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
             data, method, digest = _with_database(places_path, logger, lambda c: _read_places(c, name, logger))
             profile.visits = data["visits"]
             profile.history_db_sha256 = digest
-            profile.visit_count = len(profile.visits)
+            profile.visit_count = sum(v.visit_count for v in profile.visits)
             profile.unique_url_count = len({v.url for v in profile.visits})
             profile.unique_domain_count = len({get_domain(v.url) for v in profile.visits} - {None})
             profile.bookmark_count = data["bookmarks"]
@@ -849,36 +866,31 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
         except DatabaseAccessError as exc:
             logger.warning(f"cookies.sqlite unavailable for {name}: {exc}")
 
-    profile.visits = data["visits"]
-    profile.history_db_sha256 = digest
-    profile.visit_count = len(profile.visits)
-    profile.unique_url_count = len({v.url for v in profile.visits})
-    profile.unique_domain_count = len({get_domain(v.url) for v in profile.visits} - {None})
-    profile.bookmark_count = data["bookmarks"]
-    profile.download_count = data["downloads"]
-    profile.downloads = data["download_records"]
-    profile.history_status = (f"Read OK ({method})" if profile.visits
-                              else f"Read OK, no records ({method})")
-    logger.info(f"{name}: {profile.visit_count:,} visits, {profile.unique_url_count:,} unique URLs, "
-                f"{profile.unique_domain_count:,} unique domains.")
     return profile
 
 def _build_summary(info: BrowserInfo, profiles: List[ProfileResult],
                    unattributed: List[ProfileResult]) -> Dict:
     visits = [v for p in profiles for v in p.visits]
+    firsts = [v.first_visit_time for v in visits if v.first_visit_time]
+    lasts = [v.visit_time for v in visits if v.visit_time]
     return {
         "executable_path": info.executable_path,
         "version": info.version,
         "profile_count": len(profiles),
         "profile_names": [p.profile_name for p in profiles],
+        "profiles_with_history": sum(1 for p in profiles if p.history_status.startswith("Read OK")),
+        "windows_users": sorted({p.windows_user for p in profiles}),
         "unattributed_profile_count": len(unattributed),
+        "history_record_count": len(visits),
         "unique_url_count": len({v.url for v in visits}),
         "unique_domain_count": len({get_domain(v.url) for v in visits} - {None}),
         "bookmark_count": sum(p.bookmark_count for p in profiles),
         "download_count": sum(p.download_count for p in profiles),
         "extension_count": sum(p.extension_count for p in profiles),
         "cookie_count": sum(p.cookie_count for p in profiles),
-        "total_visits": len(visits),
+        "total_visits": sum(v.visit_count for v in visits),
+        "first_visit": min(firsts) if firsts else (min(lasts) if lasts else None),
+        "last_visit": max(lasts) if lasts else None,
     }
 
 def _run_analysis(root_drive: str, exe_path: str, logger: AnalysisLogger, result: AnalysisResult) -> None:
@@ -960,10 +972,9 @@ def analyze_all_firefox_installations(selected_drive: str,
     return [analyze_firefox(selected_drive, "Mozilla Firefox", exe, log_callback) for exe in exes]
 
 if __name__ == "__main__":
-    import json
     drive = sys.argv[1] if len(sys.argv) > 1 else "C:\\"
     exe_arg = sys.argv[2] if len(sys.argv) > 2 else None
     outcome = analyze_firefox(drive, "Mozilla Firefox", exe_arg, log_callback=print)
     print(json.dumps(outcome.summary, indent=2))
     for row in outcome.websites_visited()[:20]:
-        print(row["visit_time"], row["url"])
+        print(row["visit_time"], row["visit_count"], row["url"])

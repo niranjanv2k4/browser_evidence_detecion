@@ -27,10 +27,13 @@ class BrowserInfo:
 
 @dataclass
 class VisitRecord:
+    """One history entry per URL (same shape as the Chrome analyzer's HistoryRecord)."""
     url: str
     title: str
-    visit_time: Optional[str]
+    visit_time: Optional[str]              # most recent visit (UTC)
     profile: str
+    first_visit_time: Optional[str] = None  # earliest visit (UTC), if known
+    visit_count: int = 1                    # number of visits to this URL
 
 @dataclass
 class CookieRecord:
@@ -85,7 +88,7 @@ class ProfileResult:
     history_status: str = "Not analyzed"
     history_db_sha256: Optional[str] = None
     visits: List[VisitRecord] = field(default_factory=list)
-    visit_count: int = 0
+    visit_count: int = 0           # total visits (sum over all URLs)
     unique_url_count: int = 0
     unique_domain_count: int = 0
     bookmark_count: int = 0
@@ -111,7 +114,9 @@ class AnalysisResult:
         return asdict(self)
 
     def websites_visited(self) -> List[Dict[str, Any]]:
-        rows = [{"profile": v.profile, "url": v.url, "title": v.title, "visit_time": v.visit_time}
+        rows = [{"profile": v.profile, "url": v.url, "title": v.title,
+                 "visit_time": v.visit_time, "first_visit_time": v.first_visit_time,
+                 "visit_count": v.visit_count}
                 for p in self.profiles for v in p.visits]
         rows.sort(key=lambda r: r["visit_time"] or "", reverse=True)
         return rows
@@ -417,18 +422,32 @@ def _read_history(connection: sqlite3.Connection, profile: str, logger: Analysis
     hidden = " AND u.hidden = 0" if "hidden" in url_cols else ""
     visits: List[VisitRecord] = []
 
+    # One record per URL: visit count + first/last visit time, aggregated from the 'visits' table.
     if has_visits:
-        for url, title, when in connection.execute(
-                "SELECT u.url, u.title, v.visit_time FROM visits v JOIN urls u ON u.id = v.url "
-                f"WHERE (v.transition & 255) NOT IN (4, 5){hidden}"):
-            visits.append(VisitRecord(url or "", title or "", chrome_time_to_string(when), profile))
+        for url, title, count, first, last in connection.execute(
+                "SELECT u.url, u.title, COUNT(*), MIN(v.visit_time), MAX(v.visit_time) "
+                "FROM visits v JOIN urls u ON u.id = v.url "
+                f"WHERE (v.transition & 255) NOT IN (4, 5){hidden} "
+                "GROUP BY u.id"):
+            visits.append(VisitRecord(
+                url=url or "", title=title or "",
+                visit_time=chrome_time_to_string(last),
+                first_visit_time=chrome_time_to_string(first),
+                visit_count=int(count or 0), profile=profile))
     else:
         logger.warning(f"'visits' table unavailable for {profile}; using last-visit times only.")
-    extra = ("SELECT u.url, u.title, u.last_visit_time FROM urls u WHERE u.visit_count > 0" + hidden)
+
+    # URLs that have a counter but no rows in 'visits' (e.g. expired visit rows): fall back to urls.visit_count.
+    extra = ("SELECT u.url, u.title, u.visit_count, u.last_visit_time FROM urls u "
+             "WHERE u.visit_count > 0" + hidden)
     if has_visits:
         extra += " AND u.id NOT IN (SELECT url FROM visits)"
-    for url, title, when in connection.execute(extra):
-        visits.append(VisitRecord(url or "", title or "", chrome_time_to_string(when), profile))
+    for url, title, count, last in connection.execute(extra):
+        visits.append(VisitRecord(
+            url=url or "", title=title or "",
+            visit_time=chrome_time_to_string(last),
+            first_visit_time=None,
+            visit_count=int(count or 0), profile=profile))
     visits.sort(key=lambda v: v.visit_time or "", reverse=True)
 
     downloads = 0
@@ -569,72 +588,6 @@ def read_downloads(connection: sqlite3.Connection, profile_name: str,
         logger.warning(f"Downloads could not be fully read for {profile_name}: {exc}")
     return records
 
-def read_downloads(connection: sqlite3.Connection, profile_name: str,
-                   logger: AnalysisLogger) -> List[DownloadRecord]:
-    try:
-        available = {row[1] for row in connection.execute("PRAGMA table_info(downloads)")}
-    except sqlite3.Error as exc:
-        logger.warning(f"Could not inspect downloads table for {profile_name}: {exc}")
-        return []
-    if not available:
-        logger.info(f"{profile_name}: no 'downloads' table in History database.")
-        return []
-
-    columns = [c for c in _DOWNLOAD_COLUMNS if c in available]
-    query = f"SELECT {', '.join(columns)} FROM downloads"
-    if "start_time" in available:
-        query += " ORDER BY start_time DESC"
-
-    chains: Dict[int, List[str]] = {}
-    try:
-        for dl_id, url in connection.execute(
-                "SELECT id, url FROM downloads_url_chains ORDER BY id, chain_index"):
-            chains.setdefault(dl_id, []).append(url or "")
-    except sqlite3.Error:
-        logger.warning(f"'downloads_url_chains' unavailable for {profile_name}; "
-                       "download source URLs may be missing.")
-
-    records: List[DownloadRecord] = []
-    try:
-        for values in connection.execute(query):
-            row = dict(zip(columns, values))
-            chain = chains.get(row.get("id"), [])
-            target = row.get("target_path") or ""
-            current = row.get("current_path") or ""
-            url = chain[-1] if chain else ""
-            records.append(DownloadRecord(
-                download_id=row.get("id"),
-                guid=row.get("guid") or "",
-                file_name=_download_file_name(target, current, url),
-                target_path=target,
-                current_path=current,
-                url=url,
-                url_chain=chain,
-                referrer=row.get("referrer") or "",
-                site_url=row.get("site_url") or "",
-                tab_url=row.get("tab_url") or "",
-                tab_referrer_url=row.get("tab_referrer_url") or "",
-                start_time=chrome_time_to_string(row.get("start_time")),
-                end_time=chrome_time_to_string(row.get("end_time")),
-                last_access_time=chrome_time_to_string(row.get("last_access_time")),
-                received_bytes=int(row.get("received_bytes") or 0),
-                total_bytes=int(row.get("total_bytes") or 0),
-                state=_enum_label(DOWNLOAD_STATES, row.get("state")),
-                danger_type=_enum_label(DANGER_TYPES, row.get("danger_type")),
-                interrupt_reason=_enum_label(INTERRUPT_REASONS, row.get("interrupt_reason")),
-                opened=bool(row.get("opened")),
-                mime_type=row.get("mime_type") or "",
-                original_mime_type=row.get("original_mime_type") or "",
-                etag=row.get("etag") or "",
-                last_modified=row.get("last_modified") or "",
-                http_method=row.get("http_method") or "",
-                by_extension=row.get("by_ext_name") or "",
-                profile=profile_name,
-            ))
-    except sqlite3.Error as exc:
-        logger.warning(f"Downloads could not be fully read for {profile_name}: {exc}")
-    return records
-
 def _count_bookmarks(profile_path: str, profile: str, logger: AnalysisLogger) -> int:
     data, error = read_json_file(os.path.join(profile_path, "Bookmarks"))
     if error:
@@ -699,7 +652,7 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
             profile.history_db_sha256 = digest
             profile.download_count = data["downloads"]
             profile.downloads = data["download_records"]
-            profile.visit_count = len(profile.visits)
+            profile.visit_count = sum(v.visit_count for v in profile.visits)
             profile.unique_url_count = len({v.url for v in profile.visits})
             profile.unique_domain_count = len({get_domain(v.url) for v in profile.visits} - {None})
             profile.history_status = f"Read OK ({method})" if profile.visits else f"Read OK, no records ({method})"
@@ -720,20 +673,12 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
         except HistoryAccessError as exc:
             logger.warning(f"Cookies database unavailable for {directory}: {exc}")
 
-    profile.visits = data["visits"]
-    profile.history_db_sha256 = digest
-    profile.download_count = data["downloads"]
-    profile.downloads = data["download_records"]
-    profile.visit_count = len(profile.visits)
-    profile.unique_url_count = len({v.url for v in profile.visits})
-    profile.unique_domain_count = len({get_domain(v.url) for v in profile.visits} - {None})
-    profile.history_status = f"Read OK ({method})" if profile.visits else f"Read OK, no records ({method})"
-    logger.info(f"{directory}: {profile.visit_count:,} visits, {profile.unique_url_count:,} unique URLs, "
-                f"{profile.unique_domain_count:,} unique domains.")
     return profile
 
 def _build_summary(info: BrowserInfo, profiles: List[ProfileResult]) -> Dict:
     visits = [v for p in profiles for v in p.visits]
+    firsts = [v.first_visit_time for v in visits if v.first_visit_time]
+    lasts = [v.visit_time for v in visits if v.visit_time]
     return {
         "executable_path": info.executable_path,
         "version": info.version,
@@ -741,13 +686,18 @@ def _build_summary(info: BrowserInfo, profiles: List[ProfileResult]) -> Dict:
         "install_scope": info.install_scope,
         "profile_count": len(profiles),
         "profile_names": [p.profile_name for p in profiles],
+        "profiles_with_history": sum(1 for p in profiles if p.history_status.startswith("Read OK")),
+        "windows_users": sorted({p.windows_user for p in profiles}),
+        "history_record_count": len(visits),
         "unique_url_count": len({v.url for v in visits}),
         "unique_domain_count": len({get_domain(v.url) for v in visits} - {None}),
         "bookmark_count": sum(p.bookmark_count for p in profiles),
         "download_count": sum(p.download_count for p in profiles),
         "extension_count": sum(p.extension_count for p in profiles),
         "cookie_count": sum(p.cookie_count for p in profiles),
-        "total_visits": len(visits),
+        "total_visits": sum(v.visit_count for v in visits),
+        "first_visit": min(firsts) if firsts else (min(lasts) if lasts else None),
+        "last_visit": max(lasts) if lasts else None,
     }
 
 def _run_analysis(root_drive: str, exe_path: str, logger: AnalysisLogger, result: AnalysisResult) -> None:
@@ -830,4 +780,4 @@ if __name__ == "__main__":
     outcome = analyze_brave(drive, "Brave", exe_arg, log_callback=print)
     print(json.dumps(outcome.summary, indent=2))
     for row in outcome.websites_visited()[:20]:
-        print(row["visit_time"], row["url"])
+        print(row["visit_time"], row["visit_count"], row["url"])
