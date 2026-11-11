@@ -54,6 +54,10 @@ QComboBox:focus {
     border: 1px solid #6b7280;
 }
 
+QCheckBox {
+    color: #1f2937;
+}
+
 QPushButton#websitesButton,
 QPushButton#analyzeButton,
 QPushButton#fetchButton,

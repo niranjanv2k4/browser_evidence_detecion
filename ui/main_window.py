@@ -230,8 +230,11 @@ class MainWindow(QMainWindow):
             for r in records:
                 history_list.append({
                     'visit_time': getattr(r, 'visit_time', 'N/A'),
+                    'first_visit_time': getattr(r, 'first_visit_time', None),
                     'url': getattr(r, 'url', ''),
-                    'title': getattr(r, 'title', '')
+                    'title': getattr(r, 'title', ''),
+                    'visit_count': getattr(r, 'visit_count', 0),
+                    'profile': getattr(r, 'profile', getattr(p, 'directory_name', 'N/A')),
                 })
                 
             history_list.sort(key=lambda x: x['visit_time'] or '', reverse=True)

@@ -46,6 +46,7 @@ class HistoryRecord:
     url: str
     title: str
     visit_time: Optional[str]
+    first_visit_time: Optional[str]
     visit_count: int
     profile: str
 
@@ -626,11 +627,6 @@ def read_history_database(history_path: str, profile_name: str,
                           logger: AnalysisLogger
                           ) -> Tuple[List[HistoryRecord], Optional[str], str, Optional[str],
                                      List[DownloadRecord]]:
-    """Read Chrome's 'urls' and 'downloads' tables.
-    Returns (records, first_visit, method, sha256, downloads).
-
-    One record per distinct URL; visit_time is that URL's most recent visit.
-    """
     temp_dir = tempfile.mkdtemp(prefix="bfa_")
     try:
         connection, method, sha256 = _open_history(history_path, temp_dir, logger)
@@ -640,12 +636,16 @@ def read_history_database(history_path: str, profile_name: str,
         downloads: List[DownloadRecord] = []
         try:
             cursor = connection.execute(
-                "SELECT url, title, visit_count, last_visit_time FROM urls "
-                "ORDER BY last_visit_time DESC")
-            for url, title, visit_count, last_visit_time in cursor:
+                "SELECT url, title, visit_count, last_visit_time, "
+                "(SELECT MIN(visit_time) FROM visits WHERE visits.url = urls.id) "
+                "FROM urls "
+                "ORDER BY last_visit_time DESC"
+            )
+            for url, title, visit_count, last_visit_time, first_visit_time in cursor:
                 records.append(HistoryRecord(
                     url=url or "", title=title or "",
                     visit_time=chrome_time_to_string(last_visit_time),
+                    first_visit_time=chrome_time_to_string(first_visit_time) if first_visit_time else None,
                     visit_count=int(visit_count or 0), profile=profile_name))
             try:
                 row = connection.execute(
@@ -662,7 +662,7 @@ def read_history_database(history_path: str, profile_name: str,
         return records, first_visit, method, sha256, downloads
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
-
+        
 def read_cookies_database(cookies_path: str, profile_name: str, logger: AnalysisLogger) -> Tuple[List[CookieRecord], str, Optional[str]]:
     temp_dir = tempfile.mkdtemp(prefix="bfa_c_")
     try:
