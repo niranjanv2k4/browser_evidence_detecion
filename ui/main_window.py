@@ -1,9 +1,9 @@
 import json
 from detection.drive_detector import get_available_drives
 from detection.chrome_detection import get_installed_browsers
-from analysis.chrome_analyzer import analyze_chrome
-from analysis.firefox_analyzer import analyze_firefox
-from analysis.brave_analyzer import analyze_brave
+from analysis.browsers.chrome import analyze_chrome
+from analysis.browsers.firefox import analyze_firefox
+from analysis.browsers.brave import analyze_brave
 from ui.websites_window import WebsitesWindow
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
