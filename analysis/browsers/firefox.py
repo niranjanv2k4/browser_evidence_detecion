@@ -1,222 +1,19 @@
-# analysis/firefox_analyzer.py
-import configparser
-import hashlib
-import json
-import ntpath
 import os
 import re
-import shutil
-import sqlite3
 import string
-import sys
-import tempfile
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import unquote, urlparse
 
-@dataclass(frozen=True)
-class BrowserSpec:
-    name: str
-    exe_name: str
-    system_install_dirs: tuple
-    per_user_install_dirs: tuple
-    per_user_data_dir: str
-
-@dataclass
-class BrowserInfo:
-    name: str
-    version: Optional[str] = None
-    executable_path: Optional[str] = None
-    installation_path: Optional[str] = None
-    executable_exists: bool = False
-    install_path_for_hash: Optional[str] = None
-    install_hash_candidates: Dict[str, str] = field(default_factory=dict)
-    matched_install_hash: Optional[str] = None
-    install_hash_match_kind: Optional[str] = None
-    user_data_paths: List[str] = field(default_factory=list)
-
-@dataclass
-class VisitRecord:
-    """One history entry per URL (same shape as the Chrome analyzer's HistoryRecord)."""
-    url: str
-    title: str
-    visit_time: Optional[str]              # most recent visit (UTC)
-    profile: str
-    first_visit_time: Optional[str] = None  # earliest visit (UTC), if known
-    visit_count: int = 1                    # number of visits to this URL
-
-@dataclass
-class CookieRecord:
-    host: str
-    name: str
-    path: str
-    creation_time: Optional[str]
-    expiry_time: Optional[str]
-    is_secure: bool
-    is_httponly: bool
-    profile: str
-
-@dataclass
-class DownloadRecord:
-    """One download recorded in places.sqlite (moz_annos 'downloads/*' annotations).
-    Firefox stores far less than Chromium, so only these fields exist."""
-    download_id: Optional[int] = None       # moz_places.id of the downloaded URL
-    file_name: str = ""
-    target_path: str = ""                   # where the file was saved
-    url: str = ""                           # URL the file came from
-    referrer: str = ""                      # page the download was started from (if known)
-    start_time: Optional[str] = None        # UTC
-    end_time: Optional[str] = None          # UTC
-    total_bytes: int = 0
-    state: str = "Unknown"
-    profile: str = ""
-    extra: Dict[str, str] = field(default_factory=dict)
-
-
-@dataclass
-class ProfileResult:
-    directory_name: str
-    path: str
-    windows_user: str
-    profile_name: str = ""
-    attribution: str = "unattributed"
-    attribution_basis: str = ""
-    history_status: str = "Not analyzed"
-    history_db_sha256: Optional[str] = None
-    visits: List[VisitRecord] = field(default_factory=list)
-    visit_count: int = 0           # total visits (sum over all URLs)
-    unique_url_count: int = 0
-    unique_domain_count: int = 0
-    bookmark_count: int = 0
-    download_count: int = 0
-    extension_count: int = 0
-    downloads: List[DownloadRecord] = field(default_factory=list)
-    cookie_count: int = 0
-    cookies: List[CookieRecord] = field(default_factory=list)
-
-@dataclass
-class AnalysisResult:
-    drive: str
-    browser: Optional[BrowserInfo] = None
-    profiles: List[ProfileResult] = field(default_factory=list)
-    unattributed_profiles: List[ProfileResult] = field(default_factory=list)
-    summary: Dict[str, Any] = field(default_factory=dict)
-    warnings: List[str] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
-    log: List[str] = field(default_factory=list)
-    started_utc: Optional[str] = None
-    finished_utc: Optional[str] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    def websites_visited(self) -> List[Dict[str, Any]]:
-        rows = [{"profile": v.profile, "url": v.url, "title": v.title,
-                 "visit_time": v.visit_time, "first_visit_time": v.first_visit_time,
-                 "visit_count": v.visit_count}
-                for p in self.profiles for v in p.visits]
-        rows.sort(key=lambda r: r["visit_time"] or "", reverse=True)
-        return rows
-
-UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-
-def format_utc(dt: Optional[datetime]) -> Optional[str]:
-    return dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else None
-
-def firefox_time_to_string(value: Any) -> Optional[str]:
-    try:
-        number = int(value)
-        if number <= 0:
-            return None
-        return format_utc(UNIX_EPOCH + timedelta(microseconds=number))
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-def _firefox_seconds_to_string(value: Any) -> Optional[str]:
-    try:
-        number = int(value)
-        if number <= 0:
-            return None
-        return format_utc(UNIX_EPOCH + timedelta(seconds=number))
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-def now_utc_string() -> str:
-    return format_utc(datetime.now(timezone.utc))
-
-class AnalysisLogger:
-    def __init__(self, callback: Optional[Callable[[str], None]] = None):
-        self.entries: List[str] = []
-        self.warnings: List[str] = []
-        self.errors: List[str] = []
-        self._callback = callback
-
-    def _emit(self, prefix: str, message: str) -> None:
-        line = f"[{datetime.now().strftime('%H:%M:%S')}] {prefix}{message}"
-        self.entries.append(line)
-        if self._callback:
-            try:
-                self._callback(line)
-            except Exception:
-                pass
-
-    def info(self, message: str) -> None:
-        self._emit("", message)
-
-    def warning(self, message: str) -> None:
-        self.warnings.append(message)
-        self._emit("WARNING: ", message)
-
-    def error(self, message: str) -> None:
-        self.errors.append(message)
-        self._emit("ERROR: ", message)
-
-def read_text_file(path: str) -> Tuple[Optional[str], Optional[str]]:
-    if not os.path.isfile(path):
-        return None, "file not found"
-    last_error = "cannot be read"
-    for encoding in ("utf-8-sig", "cp1252"):
-        try:
-            with open(path, "r", encoding=encoding) as handle:
-                return handle.read(), None
-        except UnicodeDecodeError as exc:
-            last_error = str(exc)
-        except PermissionError:
-            return None, "permission denied"
-        except OSError as exc:
-            return None, f"cannot be read ({exc})"
-    return None, last_error
-
-def read_ini(path: str) -> Tuple[Optional[configparser.RawConfigParser], Optional[str]]:
-    text, error = read_text_file(path)
-    if error:
-        return None, error
-    parser = configparser.RawConfigParser(strict=False, delimiters=("=",), interpolation=None)
-    parser.optionxform = str
-    try:
-        parser.read_string(text)
-    except configparser.Error as exc:
-        return None, f"invalid INI ({exc})"
-    return parser, None
-
-def sha256_file(path: str) -> Optional[str]:
-    try:
-        digest = hashlib.sha256()
-        with open(path, "rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
-        return digest.hexdigest()
-    except OSError:
-        return None
-
-def get_domain(url: str) -> Optional[str]:
-    try:
-        host = urlparse(url).hostname
-    except ValueError:
-        return None
-    return host.lower() if host else None
+from analysis.core.constants import FIREFOX_SPEC, PROFILE_MARKERS
+from analysis.core.logger import AnalysisLogger
+from analysis.core.models import AnalysisResult, BrowserInfo, ProfileResult
+from analysis.core.utils import (
+    get_domain, list_windows_users, now_utc_string, read_ini
+)
+from analysis.extractors.firefox_extractor import (
+    DatabaseAccessError, _count_extensions, _read_firefox_cookies,
+    _read_places, _with_database
+)
 
 _M64 = (1 << 64) - 1
 _K0, _K1, _K2, _K3 = 0xc3a5c85c97cb3127, 0xb492b66fbe98f273, 0x9ae16a3b2f90404f, 0xc949d7c7509e6557
@@ -347,55 +144,6 @@ def compute_install_hash_candidates(install_dir: str, root_drive: str
     return relative, {letter: firefox_install_hash(f"{letter}:\\{relative}")
                       for letter in string.ascii_uppercase}, drive_letter
 
-FIREFOX_SPEC = BrowserSpec(
-    name="Mozilla Firefox",
-    exe_name="firefox.exe",
-    system_install_dirs=("Program Files/Mozilla Firefox",
-                         "Program Files (x86)/Mozilla Firefox",
-                         "Program Files/Mozilla Firefox ESR",
-                         "Program Files (x86)/Mozilla Firefox ESR",
-                         "Program Files/Firefox Developer Edition",
-                         "Program Files (x86)/Firefox Developer Edition",
-                         "Program Files/Firefox Nightly",
-                         "Program Files (x86)/Firefox Nightly",
-                         "Program Files/Mozilla Firefox Beta",
-                         "Program Files (x86)/Mozilla Firefox Beta"),
-    per_user_install_dirs=("AppData/Local/Mozilla Firefox",
-                           "AppData/Local/Firefox Developer Edition",
-                           "AppData/Local/Firefox Nightly"),
-    per_user_data_dir="AppData/Roaming/Mozilla/Firefox",
-)
-
-SUPPORTED_BROWSER_NAMES = {"mozilla firefox", "firefox", "firefox esr", "firefox developer edition",
-                           "firefox nightly", "firefox beta", "mozilla firefox esr"}
-
-SKIPPED_USER_DIRS = {"public", "default", "default user", "all users",
-                     "defaultuser0", "desktop.ini"}
-
-PROFILE_MARKERS = ("prefs.js", "places.sqlite", "times.json", "compatibility.ini")
-
-class DatabaseAccessError(Exception):
-    pass
-
-def _list_windows_users(root_drive: str, logger: AnalysisLogger) -> List[str]:
-    users_dir = os.path.join(root_drive, "Users")
-    users: List[str] = []
-    try:
-        with os.scandir(users_dir) as entries:
-            for entry in entries:
-                if entry.name.lower() in SKIPPED_USER_DIRS:
-                    continue
-                try:
-                    if entry.is_dir():
-                        users.append(entry.name)
-                except OSError:
-                    logger.warning(f"Cannot inspect {entry.path}")
-    except FileNotFoundError:
-        logger.warning(f"No 'Users' folder on {root_drive} (not a Windows system volume?).")
-    except OSError as exc:
-        logger.warning(f"Unable to read {users_dir}: {exc}")
-    return sorted(users)
-
 def discover_firefox_installations(root_drive: str,
                                    logger: Optional[AnalysisLogger] = None) -> List[str]:
     logger = logger or AnalysisLogger()
@@ -404,7 +152,7 @@ def discover_firefox_installations(root_drive: str,
         candidate = os.path.normpath(os.path.join(root_drive, relative, FIREFOX_SPEC.exe_name))
         if os.path.isfile(candidate):
             found.append(candidate)
-    for user in _list_windows_users(root_drive, logger):
+    for user in list_windows_users(root_drive, logger):
         for relative in FIREFOX_SPEC.per_user_install_dirs:
             candidate = os.path.normpath(
                 os.path.join(root_drive, "Users", user, relative, FIREFOX_SPEC.exe_name))
@@ -550,7 +298,7 @@ def _collect_profile_specs(root_drive: str, exe_path: str, info: BrowserInfo,
         if digest not in hash_lookup or kind == "exact":
             hash_lookup[digest] = (letter, kind)
 
-    for user in _list_windows_users(root_drive, logger):
+    for user in list_windows_users(root_drive, logger):
         firefox_root = os.path.normpath(os.path.join(root_drive, "Users", user,
                                                      FIREFOX_SPEC.per_user_data_dir))
         if not os.path.isdir(firefox_root):
@@ -611,218 +359,6 @@ def _collect_profile_specs(root_drive: str, exe_path: str, info: BrowserInfo,
                  "profile_name": entry.get("name") or _fallback_profile_name(dirname)})
 
     return sorted(specs.values(), key=lambda s: (rank[s["attribution"]], s["windows_user"], s["path"]))
-
-def _with_database(source: str, logger: AnalysisLogger,
-                   reader: Callable[[sqlite3.Connection], Any]) -> Tuple[Any, str, Optional[str]]:
-    temp_dir = tempfile.mkdtemp(prefix="bfa_ff_")
-    try:
-        copy_path = os.path.join(temp_dir, os.path.basename(source))
-        connection: Optional[sqlite3.Connection] = None
-        digest: Optional[str] = None
-        try:
-            shutil.copyfile(source, copy_path)
-            digest = sha256_file(copy_path)
-            included = []
-            for suffix in ("-wal", "-journal"):
-                if os.path.isfile(source + suffix):
-                    shutil.copyfile(source + suffix, copy_path + suffix)
-                    included.append(suffix[1:])
-            method = "temporary copy" + (f" + {', '.join(included)}" if included else "")
-            connection = sqlite3.connect(copy_path)
-        except OSError as exc:
-            logger.warning(f"Could not copy {os.path.basename(source)} ({exc}); is Firefox running? "
-                           "Trying read-only direct access (recent entries in the -wal file will be missing).")
-        if connection is None:
-            try:
-                uri = Path(source).resolve().as_uri() + "?mode=ro&immutable=1"
-                connection, method = sqlite3.connect(uri, uri=True), "direct read-only (immutable, WAL ignored)"
-            except sqlite3.Error as exc:
-                raise DatabaseAccessError(f"database locked or inaccessible ({exc})")
-        connection.text_factory = lambda raw: raw.decode("utf-8", errors="replace")
-        try:
-            return reader(connection), method, digest
-        except sqlite3.DatabaseError as exc:
-            raise DatabaseAccessError(f"database corrupted or locked ({exc})")
-        finally:
-            connection.close()
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-def _read_places(connection: sqlite3.Connection, profile: str, logger: AnalysisLogger) -> Dict[str, Any]:
-    visits: List[VisitRecord] = []
-    visits_table_ok = True
-
-    # One record per URL: visit count + first/last visit time, aggregated from 'moz_historyvisits'.
-    try:
-        for url, title, count, first, last in connection.execute(
-                "SELECT p.url, p.title, COUNT(*), MIN(v.visit_date), MAX(v.visit_date) "
-                "FROM moz_historyvisits v JOIN moz_places p ON p.id = v.place_id "
-                "WHERE p.hidden = 0 GROUP BY p.id"):
-            visits.append(VisitRecord(
-                url=url or "", title=title or "",
-                visit_time=firefox_time_to_string(last),
-                first_visit_time=firefox_time_to_string(first),
-                visit_count=int(count or 0), profile=profile))
-    except sqlite3.Error:
-        visits_table_ok = False
-        logger.warning(f"'moz_historyvisits' unavailable for {profile}; using last-visit times only.")
-
-    # Places with a counter / last-visit date but no rows in 'moz_historyvisits' (e.g. expired visits).
-    query = ("SELECT url, title, visit_count, last_visit_date FROM moz_places WHERE hidden = 0 "
-             "AND (visit_count > 0 OR last_visit_date IS NOT NULL)")
-    if visits_table_ok:
-        query += " AND id NOT IN (SELECT place_id FROM moz_historyvisits)"
-    for url, title, count, last in connection.execute(query):
-        visits.append(VisitRecord(
-            url=url or "", title=title or "",
-            visit_time=firefox_time_to_string(last),
-            first_visit_time=None,
-            visit_count=max(int(count or 0), 1), profile=profile))
-    visits.sort(key=lambda v: v.visit_time or "", reverse=True)
-
-    bookmarks = downloads = 0
-    try:
-        bookmarks = connection.execute(
-            "SELECT COUNT(*) FROM moz_bookmarks b JOIN moz_places p ON p.id = b.fk "
-            "WHERE b.type = 1 AND p.url NOT LIKE 'place:%'").fetchone()[0]
-    except sqlite3.Error as exc:
-        logger.warning(f"Bookmarks unavailable for {profile}: {exc}")
-    try:
-        downloads = connection.execute(
-            "SELECT COUNT(DISTINCT a.place_id) FROM moz_annos a "
-            "JOIN moz_anno_attributes n ON n.id = a.anno_attribute_id "
-            "WHERE n.name = 'downloads/destinationFileURI'").fetchone()[0]
-    except sqlite3.Error as exc:
-        logger.warning(f"Download records unavailable for {profile}: {exc}")
-
-    return {"visits": visits, "bookmarks": int(bookmarks or 0), "downloads": int(downloads or 0),
-            "download_records": _read_firefox_downloads(connection, profile, logger)}
-
-
-# ============================================================ downloads
-# State values stored in the 'downloads/metaData' annotation (Firefox DownloadHistory).
-FIREFOX_DOWNLOAD_STATES = {
-    1: "Complete", 2: "Failed", 3: "Cancelled", 4: "Paused", 5: "Queued",
-    6: "Blocked (parental controls)", 7: "Scanning",
-    8: "Blocked (malware / reputation)", 9: "Blocked (policy)",
-}
-
-def _file_uri_to_path(uri: str) -> str:
-    if not uri:
-        return ""
-    lowered = uri.lower()
-    if lowered.startswith("file:///"):
-        rest = unquote(uri[8:])
-        return rest.replace("/", "\\") if re.match(r"^[A-Za-z]:", rest) else "/" + rest
-    if lowered.startswith("file://"):
-        return "\\\\" + unquote(uri[7:]).replace("/", "\\")
-    return unquote(uri)
-
-def _ms_epoch_to_string(value: Any) -> Optional[str]:
-    try:
-        number = int(value)
-        if number <= 0:
-            return None
-        return format_utc(UNIX_EPOCH + timedelta(milliseconds=number))
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-def _read_firefox_downloads(connection: sqlite3.Connection, profile: str,
-                            logger: AnalysisLogger) -> List[DownloadRecord]:
-    try:
-        rows = connection.execute(
-            "SELECT p.id, p.url, p.title, d.content, d.dateAdded, m.content "
-            "FROM moz_places p "
-            "JOIN moz_annos d ON d.place_id = p.id AND d.anno_attribute_id = "
-            "(SELECT id FROM moz_anno_attributes WHERE name = 'downloads/destinationFileURI') "
-            "LEFT JOIN moz_annos m ON m.place_id = p.id AND m.anno_attribute_id = "
-            "(SELECT id FROM moz_anno_attributes WHERE name = 'downloads/metaData') "
-            "ORDER BY d.dateAdded DESC").fetchall()
-    except sqlite3.Error as exc:
-        logger.warning(f"Download details unavailable for {profile}: {exc}")
-        return []
-
-    starts: Dict[int, Any] = {}
-    referrers: Dict[int, str] = {}
-    try:
-        for place_id, when in connection.execute(
-                "SELECT place_id, MAX(visit_date) FROM moz_historyvisits "
-                "WHERE visit_type = 7 GROUP BY place_id"):
-            starts[place_id] = when
-        for place_id, ref_url in connection.execute(
-                "SELECT v.place_id, p2.url FROM moz_historyvisits v "
-                "JOIN moz_historyvisits fv ON fv.id = v.from_visit "
-                "JOIN moz_places p2 ON p2.id = fv.place_id "
-                "WHERE v.visit_type = 7 ORDER BY v.visit_date"):
-            referrers[place_id] = ref_url or ""
-    except sqlite3.Error:
-        logger.warning(f"Download visit/referrer data unavailable for {profile}.")
-
-    records: List[DownloadRecord] = []
-    for place_id, url, title, destination, added, meta_text in rows:
-        meta: Dict[str, Any] = {}
-        if meta_text:
-            try:
-                parsed = json.loads(meta_text)
-                meta = parsed if isinstance(parsed, dict) else {}
-            except ValueError:
-                logger.warning(f"Unreadable download metadata for {profile} (place {place_id}).")
-        target = _file_uri_to_path(destination or "")
-        name = ntpath.basename(target) or os.path.basename(urlparse(url or "").path) or "(unknown)"
-        state = meta.get("state")
-        try:
-            size = int(meta.get("fileSize") or 0)
-        except (TypeError, ValueError):
-            size = 0
-        extra: Dict[str, str] = {}
-        if title:
-            extra["Page Title"] = title
-        added_text = firefox_time_to_string(added)
-        if added_text:
-            extra["Annotation Added"] = added_text
-        if "deleted" in meta:
-            extra["File Deleted"] = "Yes" if meta.get("deleted") else "No"
-        if meta.get("reputationCheckVerdict"):
-            extra["Reputation Verdict"] = str(meta["reputationCheckVerdict"])
-        records.append(DownloadRecord(
-            download_id=place_id, file_name=name, target_path=target, url=url or "",
-            referrer=referrers.get(place_id, ""),
-            start_time=firefox_time_to_string(starts.get(place_id)) or added_text,
-            end_time=_ms_epoch_to_string(meta.get("endTime")),
-            total_bytes=max(size, 0),
-            state=(FIREFOX_DOWNLOAD_STATES.get(state, f"Unknown ({state})")
-                   if state is not None else "Unknown (no metadata)"),
-            profile=profile, extra=extra))
-    return records
-
-def _count_extensions(profile_path: str, profile: str, logger: AnalysisLogger) -> int:
-    path = os.path.join(profile_path, "extensions.json")
-    text, error = read_text_file(path)
-    if error:
-        if error != "file not found":
-            logger.warning(f"extensions.json unavailable for {profile}: {error}")
-        return 0
-    try:
-        addons = json.loads(text).get("addons")
-        return len(addons) if isinstance(addons, list) else 0
-    except (ValueError, AttributeError):
-        logger.warning(f"extensions.json is not valid JSON for {profile}.")
-        return 0
-
-def _read_firefox_cookies(connection: sqlite3.Connection, profile: str) -> List[CookieRecord]:
-    records = []
-    try:
-        for host, name, path, creation, expiry, secure, httponly in connection.execute(
-                "SELECT host, name, path, creationTime, expiry, isSecure, isHttpOnly FROM moz_cookies"):
-            records.append(CookieRecord(
-                host=host or "", name=name or "", path=path or "",
-                creation_time=firefox_time_to_string(creation),
-                expiry_time=_firefox_seconds_to_string(expiry),
-                is_secure=bool(secure), is_httponly=bool(httponly), profile=profile
-            ))
-    except sqlite3.Error:
-        pass
-    return records
 
 def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
     name = spec["directory_name"]
@@ -935,6 +471,10 @@ def _run_analysis(root_drive: str, exe_path: str, logger: AnalysisLogger, result
 def analyze_firefox(selected_drive: str, selected_browser: str = "Mozilla Firefox",
                     target_exe_path: Optional[str] = None,
                     log_callback: Optional[Callable[[str], None]] = None) -> AnalysisResult:
+    SUPPORTED_BROWSER_NAMES = {
+        "mozilla firefox", "firefox", "firefox esr", "firefox developer edition",
+        "firefox nightly", "firefox beta", "mozilla firefox esr"
+    }
     logger = AnalysisLogger(callback=log_callback)
     result = AnalysisResult(drive=selected_drive, started_utc=now_utc_string())
     try:
@@ -970,11 +510,3 @@ def analyze_all_firefox_installations(selected_drive: str,
                                       ) -> List[AnalysisResult]:
     exes = discover_firefox_installations(selected_drive) if os.path.isdir(selected_drive or "") else []
     return [analyze_firefox(selected_drive, "Mozilla Firefox", exe, log_callback) for exe in exes]
-
-if __name__ == "__main__":
-    drive = sys.argv[1] if len(sys.argv) > 1 else "C:\\"
-    exe_arg = sys.argv[2] if len(sys.argv) > 2 else None
-    outcome = analyze_firefox(drive, "Mozilla Firefox", exe_arg, log_callback=print)
-    print(json.dumps(outcome.summary, indent=2))
-    for row in outcome.websites_visited()[:20]:
-        print(row["visit_time"], row["visit_count"], row["url"])
