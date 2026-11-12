@@ -1,5 +1,6 @@
 import os
 import re
+import sqlite3
 import string
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -205,8 +206,53 @@ def _is_valid_profile_dir(path: str) -> bool:
     return os.path.isdir(path) and any(os.path.isfile(os.path.join(path, m)) for m in PROFILE_MARKERS)
 
 def _fallback_profile_name(directory_name: str) -> str:
-    m = re.fullmatch(r"[a-z0-9]{8}\.(.+)", directory_name)
+    m = re.fullmatch(r"[a-zA-Z0-9]{8}\.(.+)", directory_name)
     return m.group(1) if m else directory_name
+
+def _parse_profile_groups(firefox_root: str, logger: AnalysisLogger) -> Dict[str, str]:
+    names: Dict[str, str] = {}
+    pg_dir = os.path.join(firefox_root, "Profile Groups")
+    if not os.path.isdir(pg_dir):
+        return names
+
+    try:
+        with os.scandir(pg_dir) as entries:
+            for entry in entries:
+                if entry.is_file() and entry.name.endswith(".sqlite") and not entry.name.endswith(("-wal", "-shm")):
+                    try:
+                        uri = Path(entry.path).as_uri()
+                        con = sqlite3.connect(f"{uri}?mode=ro", uri=True)
+                        cur = con.cursor()
+                        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Profiles'")
+                        if cur.fetchone():
+                            for row in cur.execute("SELECT path, name FROM Profiles"):
+                                p_path, p_name = row[0], row[1]
+                                if p_path and p_name:
+                                    base = os.path.basename(str(p_path).replace("/", "\\"))
+                                    clean_name = str(p_name).strip()
+                                    if clean_name:
+                                        names[base] = clean_name
+                                        names[_norm_key(base)] = clean_name
+                        con.close()
+                    except Exception as exc:
+                        logger.warning(f"Unable to read profile group DB {entry.name}: {exc}")
+    except OSError as exc:
+        logger.warning(f"Unable to list {pg_dir}: {exc}")
+
+    return names
+
+def _resolve_profile_name(entry_name: Optional[str], dirname: str, group_names: Optional[Dict[str, str]] = None) -> str:
+    if group_names:
+        if dirname in group_names:
+            return group_names[dirname]
+        if _norm_key(dirname) in group_names:
+            return group_names[_norm_key(dirname)]
+
+    fallback = _fallback_profile_name(dirname)
+    generic_names = {"default-release", "default", "default-release-1", "default-esr"}
+    if entry_name in generic_names and fallback and fallback not in generic_names:
+        return fallback
+    return entry_name or fallback or dirname
 
 def _parse_profiles_ini(firefox_root: str, root_drive: str, logger: AnalysisLogger,
                         user: str) -> Tuple[List[Dict], Dict[str, Dict]]:
@@ -307,6 +353,7 @@ def _collect_profile_specs(root_drive: str, exe_path: str, info: BrowserInfo,
         if firefox_root not in info.user_data_paths:
             info.user_data_paths.append(firefox_root)
 
+        group_names = _parse_profile_groups(firefox_root, logger)
         entries, installs = _parse_profiles_ini(firefox_root, root_drive, logger, user)
         by_key = {_norm_key(e["path"]): e for e in entries}
 
@@ -325,7 +372,7 @@ def _collect_profile_specs(root_drive: str, exe_path: str, info: BrowserInfo,
             dirname = os.path.basename(link["path"])
             add({"directory_name": dirname, "path": link["path"], "windows_user": user,
                  "attribution": "confirmed",
-                 "profile_name": (entry or {}).get("name") or _fallback_profile_name(dirname),
+                 "profile_name": _resolve_profile_name((entry or {}).get("name"), dirname, group_names),
                  "attribution_basis": f"{link['source']} hash {digest} = install hash of "
                                       f"{letter}:\\{info.install_path_for_hash} ({kind})"})
             matched_paths.add(_norm_key(link["path"]))
@@ -356,7 +403,7 @@ def _collect_profile_specs(root_drive: str, exe_path: str, info: BrowserInfo,
                 attribution, basis = "unattributed", "no link to this installation found"
             add({"directory_name": dirname, "path": path, "windows_user": user,
                  "attribution": attribution, "attribution_basis": basis,
-                 "profile_name": entry.get("name") or _fallback_profile_name(dirname)})
+                 "profile_name": _resolve_profile_name(entry.get("name"), dirname, group_names)})
 
     return sorted(specs.values(), key=lambda s: (rank[s["attribution"]], s["windows_user"], s["path"]))
 

@@ -1,5 +1,6 @@
 # ui/main_window.py
 import json
+import re
 from dataclasses import asdict
 from detection.drive_detector import get_available_drives
 from detection.chrome_detection import get_installed_browsers
@@ -240,19 +241,40 @@ class MainWindow(QMainWindow):
             history_list.sort(key=lambda x: x['visit_time'] or '', reverse=True)
             
             name = getattr(p, 'profile_name', getattr(p, 'display_name', None))
-            if not name:
-                name = getattr(p, 'directory_name', f"Profile {len(self.current_profiles_data)}")
+            dir_name = getattr(p, 'directory_name', '')
+            clean_dir = re.sub(r'^[a-zA-Z0-9]{8}\.', '', dir_name)
             
-            label = f"{name} ({getattr(p, 'windows_user', 'User')})"
+            if not name or name == dir_name:
+                name = clean_dir if clean_dir else (dir_name or f"Profile {len(self.current_profiles_data) + 1}")
+            else:
+                name = re.sub(r'^[a-zA-Z0-9]{8}\.', '', name)
+
+            user = getattr(p, 'windows_user', 'User')
+            label = f"{name} ({user})"
+            if label in self.current_profiles_data:
+                counter = 2
+                while f"{name} #{counter} ({user})" in self.current_profiles_data:
+                    counter += 1
+                label = f"{name} #{counter} ({user})"
+
+            for rec in history_list:
+                rec['profile'] = name
+
             self.current_profiles_data[label] = history_list
 
-            self.current_downloads_data[label] = [
-                asdict(d) for d in getattr(p, 'downloads', [])
-            ]
-            
-            self.current_cookies_data[label] = [
-                asdict(c) for c in getattr(p, 'cookies', [])
-            ]
+            downloads_list = []
+            for d in getattr(p, 'downloads', []):
+                d_dict = asdict(d)
+                d_dict['profile'] = name
+                downloads_list.append(d_dict)
+            self.current_downloads_data[label] = downloads_list
+
+            cookies_list = []
+            for c in getattr(p, 'cookies', []):
+                c_dict = asdict(c)
+                c_dict['profile'] = name
+                cookies_list.append(c_dict)
+            self.current_cookies_data[label] = cookies_list
 
         if self.current_profiles_data:
             self.websites_button.setEnabled(True)
