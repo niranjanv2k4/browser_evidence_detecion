@@ -63,6 +63,13 @@ class CookieRecord:
     profile: str
 
 @dataclass
+class PasswordRecord:
+    hostname: str = ""
+    username: str = ""
+    password: str = ""
+    profile: str = ""
+
+@dataclass
 class DownloadRecord:
     download_id: Optional[int] = None
     guid: str = ""
@@ -117,6 +124,8 @@ class ProfileResult:
     downloads: List[DownloadRecord] = field(default_factory=list)
     cookie_count: int = 0
     cookies: List[CookieRecord] = field(default_factory=list)
+    password_count: int = 0
+    passwords: List[PasswordRecord] = field(default_factory=list)
 
 @dataclass
 class AnalysisResult:

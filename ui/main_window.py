@@ -10,6 +10,7 @@ from analysis.browsers.brave import analyze_brave
 from ui.websites_window import WebsitesWindow
 from ui.downloads_window import DownloadsWindow
 from ui.cookies_window import CookiesWindow
+from ui.passwords_window import PasswordsWindow
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QComboBox,
@@ -93,6 +94,7 @@ class MainWindow(QMainWindow):
         self.current_profiles_data = {}
         self.current_downloads_data = {}
         self.current_cookies_data = {}
+        self.current_passwords_data = {}
         self._build_ui()
 
     def _on_fetch_clicked(self):
@@ -141,9 +143,11 @@ class MainWindow(QMainWindow):
         self.websites_button.setEnabled(False)
         self.downloads_button.setEnabled(False)
         self.cookies_button.setEnabled(False)
+        self.passwords_button.setEnabled(False)
         self.current_profiles_data = {}
         self.current_downloads_data = {}
         self.current_cookies_data = {}
+        self.current_passwords_data = {}
         
         self.log_output.clear()
         self.findings_output.setPlainText("Analysis in progress...")
@@ -202,7 +206,7 @@ class MainWindow(QMainWindow):
             f"Unique Domains          : {summary.get('unique_domain_count', 0):,}\n"
         )
 
-        if any(k in summary for k in ("bookmark_count", "download_count", "form_history_count", "cookie_count", "extension_count")):
+        if any(k in summary for k in ("bookmark_count", "download_count", "form_history_count", "cookie_count", "extension_count", "password_count")):
             if "bookmark_count" in summary:
                 report += f"Bookmarks Found         : {summary.get('bookmark_count', 0):,}\n"
             if "download_count" in summary:
@@ -213,6 +217,8 @@ class MainWindow(QMainWindow):
                 report += f"Cookies Found           : {summary.get('cookie_count', 0):,}\n"
             if "extension_count" in summary:
                 report += f"Extensions Installed    : {summary.get('extension_count', 0):,}\n"
+            if "password_count" in summary:
+                report += f"Saved Passwords Found   : {summary.get('password_count', 0):,}\n"
 
         if "first_visit" in summary or "last_visit" in summary:
             report += (
@@ -276,6 +282,13 @@ class MainWindow(QMainWindow):
                 cookies_list.append(c_dict)
             self.current_cookies_data[label] = cookies_list
 
+            passwords_list = []
+            for pw in getattr(p, 'passwords', []):
+                pw_dict = asdict(pw)
+                pw_dict['profile'] = name
+                passwords_list.append(pw_dict)
+            self.current_passwords_data[label] = passwords_list
+
         if self.current_profiles_data:
             self.websites_button.setEnabled(True)
 
@@ -284,6 +297,9 @@ class MainWindow(QMainWindow):
             
         if any(self.current_cookies_data.values()):
             self.cookies_button.setEnabled(True)
+
+        if any(self.current_passwords_data.values()):
+            self.passwords_button.setEnabled(True)
             
     def _show_websites_window(self):
         self.websites_dialog = WebsitesWindow(self.current_profiles_data, self)
@@ -297,6 +313,10 @@ class MainWindow(QMainWindow):
     def _show_cookies_window(self):
         self.cookies_dialog = CookiesWindow(self.current_cookies_data, self)
         self.cookies_dialog.exec()
+
+    def _show_passwords_window(self):
+        self.passwords_dialog = PasswordsWindow(self.current_passwords_data, self)
+        self.passwords_dialog.exec()
 
 
     def _build_ui(self):
@@ -411,11 +431,18 @@ class MainWindow(QMainWindow):
         self.cookies_button.setEnabled(False)
         self.cookies_button.clicked.connect(self._show_cookies_window)
 
+        self.passwords_button = QPushButton("Passwords")
+        self.passwords_button.setObjectName("websitesButton")
+        self.passwords_button.setCursor(Qt.PointingHandCursor)
+        self.passwords_button.setEnabled(False)
+        self.passwords_button.clicked.connect(self._show_passwords_window)
+
         buttons_row = QHBoxLayout()
         buttons_row.setSpacing(10)
         buttons_row.addWidget(self.websites_button, 1)
         buttons_row.addWidget(self.downloads_button, 1)
         buttons_row.addWidget(self.cookies_button, 1)
+        buttons_row.addWidget(self.passwords_button, 1)
 
         findings_layout.addWidget(findings_title)
         findings_layout.addWidget(self.findings_output, 1)
