@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from analysis.core.constants import FIREFOX_SPEC, PROFILE_MARKERS
 from analysis.core.logger import AnalysisLogger
-from analysis.core.models import AnalysisResult, BrowserInfo, ProfileResult
+from analysis.core.models import AnalysisResult, BrowserInfo, PasswordRecord, ProfileResult
 from analysis.core.utils import (
     get_domain, list_windows_users, now_utc_string, read_ini
 )
@@ -15,6 +15,7 @@ from analysis.extractors.firefox_extractor import (
     DatabaseAccessError, _count_extensions, _read_firefox_cookies,
     _read_places, _with_database
 )
+from analysis.extractors.password.firefox_pass_extractor import extract_firefox_passwords
 
 _M64 = (1 << 64) - 1
 _K0, _K1, _K2, _K3 = 0xc3a5c85c97cb3127, 0xb492b66fbe98f273, 0x9ae16a3b2f90404f, 0xc949d7c7509e6557
@@ -449,6 +450,31 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
         except DatabaseAccessError as exc:
             logger.warning(f"cookies.sqlite unavailable for {name}: {exc}")
 
+    # --- Password extraction ---
+    logger.info(f"{name}: Attempting password extraction...")
+    try:
+        raw_passwords = extract_firefox_passwords(
+            spec["path"],
+            master_password="",
+            log_callback=lambda msg: logger.info(msg),
+        )
+        profile.passwords = [
+            PasswordRecord(
+                hostname=p["hostname"],
+                username=p["username"],
+                password=p["password"],
+                profile=name,
+            )
+            for p in raw_passwords
+        ]
+        profile.password_count = len(profile.passwords)
+        if profile.passwords:
+            logger.info(f"{name}: {profile.password_count:,} saved password(s) decrypted.")
+        else:
+            logger.info(f"{name}: No saved passwords found.")
+    except Exception as exc:
+        logger.warning(f"Password extraction failed for {name}: {exc}")
+
     return profile
 
 def _build_summary(info: BrowserInfo, profiles: List[ProfileResult],
@@ -471,6 +497,7 @@ def _build_summary(info: BrowserInfo, profiles: List[ProfileResult],
         "download_count": sum(p.download_count for p in profiles),
         "extension_count": sum(p.extension_count for p in profiles),
         "cookie_count": sum(p.cookie_count for p in profiles),
+        "password_count": sum(p.password_count for p in profiles),
         "total_visits": sum(v.visit_count for v in visits),
         "first_visit": min(firsts) if firsts else (min(lasts) if lasts else None),
         "last_visit": max(lasts) if lasts else None,
