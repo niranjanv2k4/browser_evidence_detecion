@@ -11,6 +11,7 @@ from ui.websites_window import WebsitesWindow
 from ui.downloads_window import DownloadsWindow
 from ui.cookies_window import CookiesWindow
 from ui.passwords_window import PasswordsWindow
+from analysis.extractors.password.brave_pass_extractor import cleanup_brave_extracted_files
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QComboBox,
@@ -474,3 +475,7 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(splitter, 1)
         self.statusBar().showMessage("Ready")
+
+    def closeEvent(self, event):
+        cleanup_brave_extracted_files()
+        super().closeEvent(event)
