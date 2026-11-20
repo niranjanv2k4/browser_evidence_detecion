@@ -8,7 +8,7 @@ from analysis.core.constants import CHROME_SPEC, PROFILE_DIR_PATTERN
 from analysis.core.logger import AnalysisLogger
 from analysis.core.models import (
     AnalysisResult, BrowserInfo, BrowserLocation,
-    HistoryStatistics, ProfileResult, VisitRecord
+    HistoryStatistics, PasswordRecord, ProfileResult, VisitRecord
 )
 from analysis.core.utils import (
     chrome_time_to_string, dig, format_utc, get_domain,
@@ -18,6 +18,7 @@ from analysis.core.utils import (
 from analysis.extractors.chromium_extractor import (
     HistoryAccessError, _read_cookies, _read_history, _with_history
 )
+from analysis.extractors.password.chrome_pass_extractor import extract_chrome_passwords
 
 def locate_browser(root_drive: str, spec: Any, logger: AnalysisLogger) -> Optional[BrowserLocation]:
     executables: List[str] = []
@@ -248,6 +249,31 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
         except HistoryAccessError as exc:
             logger.warning(f"Cookies database unavailable for {name}: {exc}")
 
+    # --- Password extraction ---
+    logger.info(f"{name}: Attempting password extraction...")
+    try:
+        raw_passwords = extract_chrome_passwords(
+            spec["path"],
+            local_state_path=os.path.join(os.path.dirname(spec["path"]), "Local State"),
+            log_callback=lambda msg: logger.info(msg),
+        )
+        profile.passwords = [
+            PasswordRecord(
+                hostname=p["hostname"],
+                username=p["username"],
+                password=p["password"],
+                profile=name,
+            )
+            for p in raw_passwords
+        ]
+        profile.password_count = len(profile.passwords)
+        if profile.passwords:
+            logger.info(f"{name}: {profile.password_count:,} saved password(s) decrypted.")
+        else:
+            logger.info(f"{name}: No saved passwords found.")
+    except Exception as exc:
+        logger.warning(f"Password extraction failed for {name}: {exc}")
+
     return profile
 
 def _build_summary(profiles: List[ProfileResult]) -> Dict:
@@ -266,6 +292,7 @@ def _build_summary(profiles: List[ProfileResult]) -> Dict:
         "last_visit": stats.last_visit,
         "download_count": sum(len(p.downloads) for p in profiles),
         "cookie_count": sum(p.cookie_count for p in profiles),
+        "password_count": sum(p.password_count for p in profiles),
     }
 
 def _run_analysis(root_drive: str, target_exe_path: Optional[str],

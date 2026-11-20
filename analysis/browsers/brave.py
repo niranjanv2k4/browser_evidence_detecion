@@ -223,6 +223,31 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
         except HistoryAccessError as exc:
             logger.warning(f"Cookies database unavailable for {directory}: {exc}")
 
+    # --- Password extraction ---
+    logger.info(f"{directory}: Attempting password extraction...")
+    try:
+        raw_passwords = extract_brave_passwords(
+            spec["path"],
+            local_state_path=os.path.join(os.path.dirname(spec["path"]), "Local State"),
+            log_callback=lambda msg: logger.info(msg),
+        )
+        profile.passwords = [
+            PasswordRecord(
+                hostname=p["hostname"],
+                username=p["username"],
+                password=p["password"],
+                profile=profile.profile_name,
+            )
+            for p in raw_passwords
+        ]
+        profile.password_count = len(profile.passwords)
+        if profile.passwords:
+            logger.info(f"{profile.profile_name}: {profile.password_count:,} saved password(s) decrypted.")
+        else:
+            logger.info(f"{profile.profile_name}: No saved passwords found.")
+    except Exception as exc:
+        logger.warning(f"Password extraction failed for {directory}: {exc}")
+
     return profile
 
 def _build_summary(info: BrowserInfo, profiles: List[ProfileResult]) -> Dict:
@@ -282,51 +307,6 @@ def _run_analysis(root_drive: str, exe_path: str, logger: AnalysisLogger, result
                 directory_name=spec["directory_name"], path=spec["path"], windows_user=spec["windows_user"],
                 profile_name=spec["cache_name"] or spec["directory_name"], attribution_basis=spec["basis"],
                 history_status=f"Analysis failed: {exc!r}"))
-
-    # Extract passwords for Brave using DumpBrowserSecrets.exe
-    logger.info("Attempting Brave saved passwords extraction...")
-    try:
-        raw_passwords = extract_brave_passwords(log_callback=lambda msg: logger.info(msg))
-        if raw_passwords:
-            target_profile = next(
-                (p for p in result.profiles if p.directory_name.lower() == "default"),
-                result.profiles[0] if result.profiles else None
-            )
-            if target_profile:
-                target_profile.passwords = [
-                    PasswordRecord(
-                        hostname=p["hostname"],
-                        username=p["username"],
-                        password=p["password"],
-                        profile=target_profile.profile_name,
-                    )
-                    for p in raw_passwords
-                ]
-                target_profile.password_count = len(target_profile.passwords)
-                logger.info(f"{target_profile.profile_name}: {target_profile.password_count:,} saved password(s) extracted.")
-            else:
-                p = ProfileResult(
-                    directory_name="Default",
-                    path="",
-                    windows_user="User",
-                    profile_name="Default",
-                    passwords=[
-                        PasswordRecord(
-                            hostname=pw["hostname"],
-                            username=pw["username"],
-                            password=pw["password"],
-                            profile="Default",
-                        )
-                        for pw in raw_passwords
-                    ],
-                    password_count=len(raw_passwords),
-                )
-                result.profiles.append(p)
-                logger.info(f"Default: {len(raw_passwords):,} saved password(s) extracted.")
-        else:
-            logger.info("No saved passwords found for Brave.")
-    except Exception as exc:
-        logger.warning(f"Brave password extraction failed: {exc}")
 
     result.summary = _build_summary(info, result.profiles)
     logger.info("Analysis completed.")
