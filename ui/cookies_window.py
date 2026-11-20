@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 
 
 class CookiesWindow(QDialog):
-    COLUMNS = ["Host", "Name", "Path", "Created"]
+    COLUMNS = ["Host", "Name", "Value", "Path", "Created"]
 
     def __init__(self, profiles_data, parent=None):
         super().__init__(parent)
@@ -72,10 +72,12 @@ class CookiesWindow(QDialog):
         header.setSectionResizeMode(0, QHeaderView.Interactive)
         header.setSectionResizeMode(1, QHeaderView.Interactive)
         header.setSectionResizeMode(2, QHeaderView.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.Interactive)
         header.setStretchLastSection(True)
-        self.table.setColumnWidth(0, 200)
-        self.table.setColumnWidth(1, 200)
-        self.table.setColumnWidth(2, 150)
+        self.table.setColumnWidth(0, 180)
+        self.table.setColumnWidth(1, 150)
+        self.table.setColumnWidth(2, 250)
+        self.table.setColumnWidth(3, 120)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
 
         details_frame = QVBoxLayout()
@@ -120,6 +122,7 @@ class CookiesWindow(QDialog):
             cells = [
                 c.get("host") or "(unknown)",
                 c.get("name") or "(unknown)",
+                c.get("value") or "",
                 c.get("path") or "/",
                 c.get("creation_time") or "N/A",
             ]
@@ -168,18 +171,22 @@ class CookiesWindow(QDialog):
         section("IDENTIFICATION", [
             ("Host", "host", val("host")),
             ("Name", "name", val("name")),
+            ("Value", "value", val("value")),
             ("Path", "path", val("path")),
             ("Profile", "profile", val("profile")),
         ])
         
         section("TIMELINE", [
             ("Created (UTC)", "creation_time", val("creation_time")),
+            ("Last Access (UTC)", "last_access_time", val("last_access_time")),
             ("Expires (UTC)", "expiry_time", val("expiry_time")),
         ])
         
-        section("SECURITY FLAGS", [
+        section("SECURITY & ATTRIBUTES", [
             ("Secure", "is_secure", "Yes" if c.get("is_secure") else "No"),
             ("HttpOnly", "is_httponly", "Yes" if c.get("is_httponly") else "No"),
+            ("Persistent", "is_persistent", "Yes" if c.get("is_persistent") else "No"),
+            ("SameSite", "samesite", val("samesite")),
         ])
         
         return "\n".join(lines)

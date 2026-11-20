@@ -14,7 +14,9 @@ from analysis.core.utils import (
 from analysis.extractors.chromium_extractor import (
     HistoryAccessError, _read_cookies, _read_history, _with_history
 )
-from analysis.extractors.password.brave_pass_extractor import extract_brave_passwords
+from analysis.extractors.password.brave_pass_extractor import (
+    derive_brave_ciphers, extract_brave_passwords
+)
 
 def discover_brave_installations(root_drive: str, logger: Optional[AnalysisLogger] = None) -> List[str]:
     logger = logger or AnalysisLogger()
@@ -216,7 +218,12 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
     cookies_path = next((p for p in cookies_paths if os.path.isfile(p)), None)
     if cookies_path:
         try:
-            c_data, c_method, c_digest = _with_history(cookies_path, logger, lambda c: _read_cookies(c, directory))
+            local_state_path = os.path.join(os.path.dirname(spec["path"]), "Local State")
+            v20_cipher, v10_cipher = derive_brave_ciphers(local_state_path, log_callback=lambda m: logger.info(m))
+            c_data, c_method, c_digest = _with_history(
+                cookies_path, logger,
+                lambda c: _read_cookies(c, directory, v20_cipher=v20_cipher, v10_cipher=v10_cipher, logger=logger)
+            )
             profile.cookies = c_data
             profile.cookie_count = len(c_data)
             logger.info(f"{directory}: {profile.cookie_count:,} cookies found.")
