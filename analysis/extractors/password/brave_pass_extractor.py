@@ -56,6 +56,71 @@ def cleanup_brave_extracted_files() -> None:
                 pass
 
 
+def derive_brave_ciphers(local_state_path: str,
+                         log_callback: Optional[Callable[[str], None]] = None):
+    """
+    Returns (v20_cipher, v10_cipher) derived from a Brave Local State file.
+    """
+    v20_cipher = None
+    v10_cipher = None
+
+    if not local_state_path or not os.path.isfile(str(local_state_path)):
+        return v20_cipher, v10_cipher
+
+    try:
+        with open(local_state_path, "r", encoding="utf-8") as f:
+            local_state = json.load(f)
+    except Exception as e:
+        if log_callback:
+            log_callback(f"Failed to read Local State: {e}")
+        return v20_cipher, v10_cipher
+
+    os_crypt = local_state.get("os_crypt", {})
+    app_bound_encrypted_key = os_crypt.get("app_bound_encrypted_key")
+    encrypted_key = os_crypt.get("encrypted_key")
+
+    # 1. Derive v20 Master Key (Brave simplified path)
+    if app_bound_encrypted_key:
+        if not is_admin():
+            if log_callback:
+                log_callback("Admin privileges required for Brave v20 decryption.")
+        else:
+            try:
+                raw_appb = binascii.a2b_base64(app_bound_encrypted_key)
+                if raw_appb[:4] == b"APPB":
+                    key_blob_encrypted = raw_appb[4:]
+                    with impersonate_lsass():
+                        key_blob_system_decrypted = windows.crypto.dpapi.unprotect(key_blob_encrypted)
+                    key_blob_user_decrypted = windows.crypto.dpapi.unprotect(key_blob_system_decrypted)
+
+                    if len(key_blob_user_decrypted) >= 32:
+                        v20_master_key = key_blob_user_decrypted[-32:]
+                        v20_cipher = AESGCM(v20_master_key)
+                        if log_callback:
+                            log_callback("Derived Brave v20 master key via DPAPI.")
+                    else:
+                        if log_callback:
+                            log_callback(f"Unexpected v20 key length: {len(key_blob_user_decrypted)}")
+            except Exception as e:
+                if log_callback:
+                    log_callback(f"Failed to derive Brave v20 master key: {e}")
+
+    # 2. Derive v10 Master Key (Standard DPAPI path)
+    if encrypted_key:
+        try:
+            raw_key = binascii.a2b_base64(encrypted_key)
+            if raw_key[:5] == b"DPAPI":
+                v10_master_key = windows.crypto.dpapi.unprotect(raw_key[5:])
+                v10_cipher = AESGCM(v10_master_key)
+                if log_callback:
+                    log_callback("Derived Brave v10 master key via DPAPI.")
+        except Exception as e:
+            if log_callback:
+                log_callback(f"Failed to derive Brave v10 master key: {e}")
+
+    return v20_cipher, v10_cipher
+
+
 def extract_brave_passwords(profile_dir_path: str,
                             local_state_path: Optional[Any] = None,
                             log_callback: Optional[Callable[[str], None]] = None) -> List[Dict[str, str]]:
@@ -91,61 +156,7 @@ def extract_brave_passwords(profile_dir_path: str,
             log_callback(f"Local State not found for {profile_dir}")
         return []
 
-    # 1. Read Local State
-    try:
-        with open(local_state_path, "r", encoding="utf-8") as f:
-            local_state = json.load(f)
-    except Exception as e:
-        if log_callback:
-            log_callback(f"Failed to read Local State: {e}")
-        return []
-
-    os_crypt = local_state.get("os_crypt", {})
-    app_bound_encrypted_key = os_crypt.get("app_bound_encrypted_key")
-    encrypted_key = os_crypt.get("encrypted_key")
-
-    v20_cipher = None
-    v10_cipher = None
-
-    # 2. Derive v20 Master Key (Brave simplified path)
-    if app_bound_encrypted_key:
-        if not is_admin():
-            if log_callback:
-                log_callback("Admin privileges required for Brave v20 decryption.")
-        else:
-            try:
-                raw_appb = binascii.a2b_base64(app_bound_encrypted_key)
-                if raw_appb[:4] == b"APPB":
-                    key_blob_encrypted = raw_appb[4:]
-                    # Double DPAPI decryption (SYSTEM then User)
-                    with impersonate_lsass():
-                        key_blob_system_decrypted = windows.crypto.dpapi.unprotect(key_blob_encrypted)
-                    key_blob_user_decrypted = windows.crypto.dpapi.unprotect(key_blob_system_decrypted)
-
-                    if len(key_blob_user_decrypted) >= 32:
-                        v20_master_key = key_blob_user_decrypted[-32:]
-                        v20_cipher = AESGCM(v20_master_key)
-                        if log_callback:
-                            log_callback("Derived Brave v20 master key via DPAPI.")
-                    else:
-                        if log_callback:
-                            log_callback(f"Unexpected v20 key length: {len(key_blob_user_decrypted)}")
-            except Exception as e:
-                if log_callback:
-                    log_callback(f"Failed to derive Brave v20 master key: {e}")
-
-    # 3. Derive v10 Master Key (Standard DPAPI path)
-    if encrypted_key:
-        try:
-            raw_key = binascii.a2b_base64(encrypted_key)
-            if raw_key[:5] == b"DPAPI":
-                v10_master_key = windows.crypto.dpapi.unprotect(raw_key[5:])
-                v10_cipher = AESGCM(v10_master_key)
-                if log_callback:
-                    log_callback("Derived Brave v10 master key via DPAPI.")
-        except Exception as e:
-            if log_callback:
-                log_callback(f"Failed to derive Brave v10 master key: {e}")
+    v20_cipher, v10_cipher = derive_brave_ciphers(local_state_path, log_callback)
 
     # 4. Extract and decrypt logins
     results: List[Dict[str, str]] = []

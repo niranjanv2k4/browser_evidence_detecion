@@ -56,11 +56,15 @@ class CookieRecord:
     host: str
     name: str
     path: str
-    creation_time: Optional[str]
-    expiry_time: Optional[str]
-    is_secure: bool
-    is_httponly: bool
-    profile: str
+    creation_time: Optional[str] = None
+    expiry_time: Optional[str] = None
+    is_secure: bool = False
+    is_httponly: bool = False
+    value: str = ""
+    last_access_time: Optional[str] = None
+    is_persistent: bool = False
+    samesite: Optional[str] = None
+    profile: str = ""
 
 @dataclass
 class PasswordRecord:

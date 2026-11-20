@@ -207,15 +207,51 @@ def _count_extensions(profile_path: str, profile: str, logger: AnalysisLogger) -
 
 
 def _read_firefox_cookies(connection: sqlite3.Connection, profile: str) -> List[CookieRecord]:
+    try:
+        cols = {row[1] for row in connection.execute("PRAGMA table_info(moz_cookies)")}
+    except sqlite3.Error:
+        return []
+    if not cols:
+        return []
+
+    select = ["host", "name", "path", "creationTime", "expiry", "isSecure", "isHttpOnly"]
+    has_val = "value" in cols
+    if has_val:
+        select.append("value")
+    has_last = "lastAccessed" in cols
+    if has_last:
+        select.append("lastAccessed")
+    has_same = "sameSite" in cols
+    if has_same:
+        select.append("sameSite")
+
     records = []
     try:
-        for host, name, path, creation, expiry, secure, httponly in connection.execute(
-                "SELECT host, name, path, creationTime, expiry, isSecure, isHttpOnly FROM moz_cookies"):
+        for row in connection.execute(f"SELECT {', '.join(select)} FROM moz_cookies"):
+            host, name, path, creation, expiry, secure, httponly = row[:7]
+            idx = 7
+            val = ""
+            if has_val:
+                val = row[idx] or ""
+                idx += 1
+            last_access = None
+            if has_last:
+                last_access = row[idx]
+                idx += 1
+            samesite = None
+            if has_same:
+                samesite = str(row[idx]) if row[idx] is not None else None
+                idx += 1
+
             records.append(CookieRecord(
                 host=host or "", name=name or "", path=path or "",
                 creation_time=firefox_time_to_string(creation),
                 expiry_time=_firefox_seconds_to_string(expiry),
-                is_secure=bool(secure), is_httponly=bool(httponly), profile=profile
+                is_secure=bool(secure), is_httponly=bool(httponly),
+                value=val,
+                last_access_time=firefox_time_to_string(last_access) if last_access else None,
+                samesite=samesite,
+                profile=profile,
             ))
     except sqlite3.Error:
         pass

@@ -14,8 +14,10 @@ from analysis.core.constants import (
     _DOWNLOAD_COLUMNS, DANGER_TYPES, DOWNLOAD_STATES, INTERRUPT_REASONS
 )
 
+
 class HistoryAccessError(Exception):
     pass
+
 
 def _with_history(source: str, logger: AnalysisLogger,
                   reader: Callable[[sqlite3.Connection], Any]) -> Tuple[Any, str, Optional[str]]:
@@ -36,7 +38,7 @@ def _with_history(source: str, logger: AnalysisLogger,
             method = "temporary copy" + (f" + {', '.join(included)}" if included else "")
             connection = sqlite3.connect(copy_path)
         except OSError as exc:
-            logger.warning(f"Could not copy History database ({exc}); is browser running? Trying read-only direct access.")
+            logger.warning(f"Could not copy database ({exc}); trying read-only direct access.")
         if connection is None:
             try:
                 uri = Path(source).resolve().as_uri() + "?mode=ro&immutable=1"
@@ -53,11 +55,13 @@ def _with_history(source: str, logger: AnalysisLogger,
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+
 def _columns(connection: sqlite3.Connection, table: str) -> set:
     try:
         return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
     except sqlite3.Error:
         return set()
+
 
 def _read_history(connection: sqlite3.Connection, profile: str, logger: AnalysisLogger) -> Dict[str, Any]:
     url_cols = _columns(connection, "urls")
@@ -100,12 +104,14 @@ def _read_history(connection: sqlite3.Connection, profile: str, logger: Analysis
     return {"visits": visits, "downloads": downloads,
             "download_records": read_downloads(connection, profile, logger)}
 
+
 def _enum_label(mapping: Dict[int, str], value: Any) -> str:
     try:
         number = int(value)
     except (TypeError, ValueError):
         return "Unknown"
     return mapping.get(number, f"Unknown ({number})")
+
 
 def _download_file_name(target: str, current: str, url: str) -> str:
     for path in (target, current):
@@ -118,6 +124,7 @@ def _download_file_name(target: str, current: str, url: str) -> str:
     except ValueError:
         name = ""
     return name or "(unknown)"
+
 
 def read_downloads(connection: sqlite3.Connection, profile_name: str,
                    logger: AnalysisLogger) -> List[DownloadRecord]:
@@ -141,8 +148,7 @@ def read_downloads(connection: sqlite3.Connection, profile_name: str,
                 "SELECT id, url FROM downloads_url_chains ORDER BY id, chain_index"):
             chains.setdefault(dl_id, []).append(url or "")
     except sqlite3.Error:
-        logger.warning(f"'downloads_url_chains' unavailable for {profile_name}; "
-                       "download source URLs may be missing.")
+        logger.warning(f"'downloads_url_chains' unavailable for {profile_name}.")
 
     records: List[DownloadRecord] = []
     try:
@@ -185,17 +191,82 @@ def read_downloads(connection: sqlite3.Connection, profile_name: str,
         logger.warning(f"Downloads could not be fully read for {profile_name}: {exc}")
     return records
 
-def _read_cookies(connection: sqlite3.Connection, profile: str) -> List[CookieRecord]:
-    records = []
+
+def _read_cookies(connection: sqlite3.Connection,
+                  profile: str,
+                  v20_cipher=None,
+                  v10_cipher=None,
+                  logger: Optional[AnalysisLogger] = None) -> List[CookieRecord]:
+    from analysis.extractors.password.chrome_pass_extractor import decrypt_chromium_blob
+
     try:
-        for host, name, path, creation, expires, secure, httponly in connection.execute(
-                "SELECT host_key, name, path, creation_utc, expires_utc, is_secure, is_httponly FROM cookies"):
+        cols = {row[1] for row in connection.execute("PRAGMA table_info(cookies)")}
+    except sqlite3.Error:
+        return []
+    if not cols:
+        return []
+
+    has_plain_value = "value" in cols
+    select = ["host_key", "name", "path", "creation_utc", "expires_utc",
+              "is_secure", "is_httponly", "CAST(encrypted_value AS BLOB)"]
+    if has_plain_value:
+        select.append("value")
+    optional = []
+    if "last_access_utc" in cols:
+        optional.append("last_access_utc")
+    if "is_persistent" in cols:
+        optional.append("is_persistent")
+    if "samesite" in cols:
+        optional.append("samesite")
+    select.extend(optional)
+
+    records: List[CookieRecord] = []
+    logged_decrypt_err = False
+
+    def _cookie_log(m: str):
+        nonlocal logged_decrypt_err
+        if not logged_decrypt_err and logger:
+            logged_decrypt_err = True
+            logger.warning(m)
+
+    try:
+        base_len = 9 if has_plain_value else 8
+        for row in connection.execute(f"SELECT {', '.join(select)} FROM cookies"):
+            (host, name, path, creation, expires, secure, httponly, enc_value) = row[:8]
+            plain_val = row[8] if has_plain_value else ""
+            rest = row[base_len:]
+
+            last_access = None
+            is_persistent = False
+            samesite = None
+            for col, val in zip(optional, rest):
+                if col == "last_access_utc":
+                    last_access = val
+                elif col == "is_persistent":
+                    is_persistent = bool(val)
+                elif col == "samesite":
+                    samesite = str(val) if val is not None else None
+
+            if enc_value:
+                value = decrypt_chromium_blob(
+                    enc_value, v20_cipher, v10_cipher, skip_header=32,
+                    log_callback=_cookie_log,
+                )
+            else:
+                value = str(plain_val or "")
+
             records.append(CookieRecord(
                 host=host or "", name=name or "", path=path or "",
                 creation_time=chrome_time_to_string(creation),
                 expiry_time=chrome_time_to_string(expires),
-                is_secure=bool(secure), is_httponly=bool(httponly), profile=profile
+                is_secure=bool(secure), is_httponly=bool(httponly),
+                value=value,
+                last_access_time=chrome_time_to_string(last_access),
+                is_persistent=is_persistent,
+                samesite=samesite,
+                profile=profile,
             ))
-    except sqlite3.Error:
-        pass
+    except sqlite3.Error as exc:
+        if logger:
+            logger.warning(f"Cookie read failed for {profile}: {exc}")
     return records

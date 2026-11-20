@@ -18,7 +18,9 @@ from analysis.core.utils import (
 from analysis.extractors.chromium_extractor import (
     HistoryAccessError, _read_cookies, _read_history, _with_history
 )
-from analysis.extractors.password.chrome_pass_extractor import extract_chrome_passwords
+from analysis.extractors.password.chrome_pass_extractor import (
+    derive_chromium_ciphers, extract_chrome_passwords
+)
 
 def locate_browser(root_drive: str, spec: Any, logger: AnalysisLogger) -> Optional[BrowserLocation]:
     executables: List[str] = []
@@ -242,7 +244,12 @@ def _analyze_profile(spec: Dict, logger: AnalysisLogger) -> ProfileResult:
     cookies_path = next((p for p in cookies_paths if os.path.isfile(p)), None)
     if cookies_path:
         try:
-            c_records, c_method, c_sha256 = _with_history(cookies_path, logger, lambda c: _read_cookies(c, name))
+            local_state_path = os.path.join(os.path.dirname(spec["path"]), "Local State")
+            v20_cipher, v10_cipher = derive_chromium_ciphers(local_state_path, log_callback=lambda m: logger.info(m))
+            c_records, c_method, c_sha256 = _with_history(
+                cookies_path, logger,
+                lambda c: _read_cookies(c, name, v20_cipher=v20_cipher, v10_cipher=v10_cipher, logger=logger)
+            )
             profile.cookies = c_records
             profile.cookie_count = len(c_records)
             logger.info(f"{name}: {profile.cookie_count:,} cookies found.")
