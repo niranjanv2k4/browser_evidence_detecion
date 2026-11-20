@@ -1,5 +1,6 @@
 # ui/main_window.py
 import json
+import os
 import re
 from dataclasses import asdict
 from detection.drive_detector import get_available_drives
@@ -26,6 +27,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+WHOLE_SYSTEM_OPTION = "Whole System"
+
 
 class BrowserScannerWorker(QThread):
     browser_found = Signal(str, dict)
@@ -37,11 +40,20 @@ class BrowserScannerWorker(QThread):
         self._is_running = True
 
     def run(self):
-        browsers = get_installed_browsers(self.drive)
-        for browser in browsers:
+        if self.drive.lower() == WHOLE_SYSTEM_OPTION.lower():
+            drives = get_available_drives()
+        else:
+            drives = [self.drive]
+
+        for d in drives:
             if not self._is_running:
                 break
-            self.browser_found.emit(browser["name"], browser)
+            browsers = get_installed_browsers(d)
+            for browser in browsers:
+                if not self._is_running:
+                    break
+                browser["drive"] = d
+                self.browser_found.emit(browser["name"], browser)
         self.finished.emit()
 
     def stop(self):
@@ -138,6 +150,9 @@ class MainWindow(QMainWindow):
             
         browser_name = browser_data["name"]
         exe_path = browser_data["path"]
+
+        if drive.lower() == WHOLE_SYSTEM_OPTION.lower():
+            drive = browser_data.get("drive") or (os.path.splitdrive(exe_path)[0] + "\\")
 
         self.analyze_button.setText("Analyzing...")
         self.analyze_button.setEnabled(False)
@@ -350,6 +365,8 @@ class MainWindow(QMainWindow):
         self.source_combo = QComboBox()
         self.source_combo.setCurrentIndex(-1)
         self.source_combo.setPlaceholderText("Select a drive or disk image")
+
+        self.source_combo.addItem(WHOLE_SYSTEM_OPTION)
 
         drives = get_available_drives()
         for drive in drives:
